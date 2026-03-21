@@ -1,0 +1,41 @@
+TYPE_FILE = {
+	".py": "python",
+	".python": "python",
+	".cpp": "c++",
+	".c": "c++",
+	".java": "java",
+	".cs": "c#",
+	".sql": "sql",
+	".asm": "asm",
+	".r": "R",
+	".lua": "Lua",
+	".go": "Go",
+	".rs": "Rust",
+	".swift": "Swift",
+	".kt": "Kotlin",
+	".bat": "Batch",
+	".cmd": "Batch",
+	".sh": "Shell",
+	".ps1": "PowerShell",
+}
+
+TYPE_RUN_SYNTAX = {
+	".py": ["python", "-u", "{file}"],
+	".cpp": ["g++", "-o", "{out}", "{file}"],
+	".c": ["gcc", "-o", "{out}", "{file}"],
+	".java": ["java", "{file}"],
+	".cs": ["dotnet", "script", "{file}"],
+	".sql": "",
+	".asm": "",
+	".r": ["Rscript", "{file}"],
+	".lua": ["lua", "{file}"],
+	".go": ["go", "run", "{file}"],
+	".rs": ["rustc", "{file}", "-o", "{out}"],
+	".swift": ["swift", "{file}"],
+	".kt": ["kotlin", "{file}"],
+	".bat": ["cmd", "/c", "{file}"],
+	".sh": ["bash", "{file}"],
+	".ps1": ["{file}"],
+}
+
+
