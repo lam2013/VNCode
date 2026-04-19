@@ -1,3 +1,5 @@
+from pathlib import *
+path = Path(__file__).parent
 TYPE_FILE = {
 	".py": "python",
 	".python": "python",
@@ -14,7 +16,6 @@ TYPE_FILE = {
 	".swift": "Swift",
 	".kt": "Kotlin",
 	".bat": "Batch",
-	".cmd": "Batch",
 	".sh": "Shell",
 	".ps1": "PowerShell",
 }
@@ -38,4 +39,21 @@ TYPE_RUN_SYNTAX = {
 	".ps1": ["{file}"],
 }
 
-
+ICON_LANGUESE = {
+	"c": f"{path}/icon/icon_L/icon_languese_c.png",
+    "cpp": f"{path}/icon/icon_L/icon_languese_cpp.png",
+    "python": f"{path}/icon/icon_L/icon_languese_python.png",
+    "java": f"{path}/icon/icon_L/icon_languese_java.png",
+    "cs": f"{path}/icon/icon_L/icon_languese_cs.png",
+    "sql": f"{path}/icon/icon_L/icon_languese_sql.png",
+    "asm": f"{path}/icon/icon_L/icon_languese_asm.png",
+    "r": f"{path}/icon/icon_L/icon_languese_R.png",
+    "lua": f"{path}/icon/icon_L/icon_languese_lua.png",
+    "go": f"{path}/icon/icon_L/icon_languese_go.png",
+    "rs": f"{path}/icon/icon_L/icon_languese_rust.png",
+    "swift": f"{path}/icon/icon_L/icon_languese_swift.png",
+    "kt": f"{path}/icon/icon_L/icon_languese_kotlin.png",
+	"bat": f"{path}/icon/icon_L/icon_languese_batch.png",
+	"sh": f"{path}/icon/icon_L/icon_languese_powershell.png",
+    "ps1": f"{path}/icon/icon_L/icon_languese_powershell.png",
+}

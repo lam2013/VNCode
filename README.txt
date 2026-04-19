@@ -1,9 +1,6 @@
-___           ___    ___    ______     ________     _________     ________     ________
-\  \         /  /   |   |  /      |   /  ______\   /   ___   \   |  ____  \   |   _____|
- \  \       /  /    |   | /  /|   |   | |          |  /   \  |   | |    \ |   |  |_____     
-  \  \     /  /     |   |/  / |   |   | |          |  |   |  |   | |    | |   |   _____|
-   \  \___/  /      |      /  |   |   | |_______   |  \___/  |   | |____/ |   |  |_____
-    \_______/       |_____/   |___|   \________/   \_________/   |________/   |________|
+=============================
+		   VNCode
+============================
     
 
 giới thiệu:
@@ -39,6 +36,15 @@ tính năng:
 		+bash
 		+swift
 		+kotlin
+		+powershell
+
+tính năng mới:
+-thêm extension marketplace
+-hỗ trợ đa số extension
+-thêm LSP:
++python
+mini update:
+-thêm icon languese
 
 cách chạy:
 1. chạy thủ công(nếu bạn biết sơ về command):
@@ -57,7 +63,7 @@ link tải python: https://www.python.org/downloads/
 thư viện được dùng:
 	+ PyQt5
 	+ sys
-	+json
+	+ json
 	+ os
 	+ collections
 	+ pathlib

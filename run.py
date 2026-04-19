@@ -11,18 +11,56 @@ from list_module import *
 from fill_module import *
 import re
 from collections import defaultdict
+from marketplace_widget import MarketplaceWidget
+import extension_manager
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+
+# Fix encoding for Windows console (cp1252 cannot handle Vietnamese characters)
+import io
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+else:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+def setup_logging():
+    """Set up centralized logging to APPDATA/VNCode/logs/vncode.log"""
+    log_dir = Path(os.getenv('APPDATA')) / 'VNCode' / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    log_file = log_dir / 'vncode.log'
+    logger = logging.getLogger('vncode')
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    handler = RotatingFileHandler(
+        str(log_file),
+        maxBytes=5*1024*1024,
+        backupCount=5,
+        encoding='utf-8'
+    )
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        '[%(asctime)s] %(levelname)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    
+    return logger
+
+logger = setup_logging()
 
 SYNTAX_INFO = {
-    # Dùng cho panel gợi ý cú pháp ở dưới (syntax_view)
-    # Giá trị là chuỗi các keyword, cách nhau bởi dấu phẩy.
     "python": ", ".join(sorted(KEYWORDS)),
-    # Gợi ý đơn giản cho C/C++
     "c": ", ".join(C_CPP_VARIBLE_SYNTAX),
     "c++": ", ".join(C_CPP_VARIBLE_SYNTAX),
 }
 
 
-print("2025 VNCORE LAB(alias of Nguyễn Trường Lâm)")
+logger.info("2025 VNCORE LAB(alias of Nguyễn Trường Lâm)")
 
 def resource_path(relative_path):
     """Trả về đường dẫn tuyệt đối đến resource, hoạt động cả khi chạy script lẫn khi build exe (PyInstaller)."""
@@ -52,7 +90,6 @@ class RenameDialog(QDialog):
         return self.line_edit.text()
 
 class Main(QMainWindow):
-    # Keyword sets — chỉ cần cho C/C++ vì các ngôn ngữ khác đã dùng LSP
     LANG_KEYWORDS = {
         'cpp': {
             'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default', 'break', 'continue',
@@ -76,13 +113,13 @@ class Main(QMainWindow):
         return ext_map.get(ext, '')
 
     def get_buffer_symbols(self, text: str, cursor_pos: int = 0, prefix: str = "", lang: str = None) -> list[tuple[str, str]]:
-        """Lấy tất cả identifier có trong file, phân loại theo scope, ưu tiên gần con trỏ"""
+        """Lấy tất cả identifier có trong file, phân loại theo scope, ưu tiên gần cursor"""
         if lang == "cpp" or lang == "c":
-            return self.get_buffer_symbols_cpp(text, cursor_pos, prefix)
+            return self.get_buffer_symbols_cpp(text, cursor_pos, prefix, lang)
         symbols = defaultdict(set)  # type -> set[symbol]
         lines = text.splitlines()
         
-        # Đảm bảo index dòng hợp lệ
+        # Ensure valid line index
         if cursor_pos > len(text): cursor_pos = len(text)
         current_line = text[:cursor_pos].count('\n')
 
@@ -118,7 +155,7 @@ class Main(QMainWindow):
             except Exception:
                 pass # Fallback to regex if AST fails (e.g. syntax error while typing)
 
-        if not symbols: # Nếu không phải python hoặc AST fail, dùng regex chung
+        if not symbols: # If not Python or AST fails, use general regex
             scope_level = 0
             in_class = False
             in_function = False
@@ -127,12 +164,12 @@ class Main(QMainWindow):
                 if not stripped:
                     continue
                 if lang in ["python", "nim", "yaml", "txt"]:
-                    scope_level = (len(line) - len(line.lstrip())) // 4 # Ước lượng mỗi thụt lề 4 space
+                    scope_level = (len(line) - len(line.lstrip())) // 4 # Estimate each indent as 4 spaces
                 else:
                     scope_level += line.count('{') - line.count('}')
 
 
-                # Phát hiện class/struct/enum
+                # Detect class/struct/enum
                 class_pat = r'^\s*(class|struct|enum)\s+([a-zA-Z_][a-zA-Z0-9_]*)'
                 if re.match(class_pat, stripped):
                     match = re.search(class_pat, stripped)
@@ -142,7 +179,7 @@ class Main(QMainWindow):
                         in_class = True
                         continue
 
-                # Phát hiện hàm / method
+                # Detect function/method
                 func_pat = r'^\s*(?:[\w:]+\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)\s*(const)?\s*\{?'
                 if re.match(func_pat, stripped):
                     match = re.search(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', stripped)
@@ -152,7 +189,7 @@ class Main(QMainWindow):
                         in_function = True
                         continue
 
-                # Phát hiện biến (global / member / local / parameter)
+                # Detect variables (global/member/local/parameter)
                 var_pat = r'(?:const\s+)?(?:unsigned\s+)?(?:\w+(?:\s*\*|\s*&)?\s+)+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=|[;,)])'
                 matches = re.finditer(var_pat, line)
                 for match in matches:
@@ -166,7 +203,7 @@ class Main(QMainWindow):
                     else:
                         symbols['local_var'].add(name)
 
-                # Parameter trong hàm (trong ngoặc)
+                # Parameters in function (in parentheses)
                 if '(' in line and ')' in line and in_function:
                     param_part = re.search(r'\(([^)]*)\)', line)
                     if param_part:
@@ -179,42 +216,71 @@ class Main(QMainWindow):
         kw_suggestions = []
         sym_suggestions = []
         
-        # 1. Thêm Keywords từ ngôn ngữ
+        # 1. Add language keywords (prioritize LSP extension if available)
         if lang:
             kw_list = set()
-            # Ưu tiên set chuẩn trong LANG_KEYWORDS
-            if lang in self.LANG_KEYWORDS:
-                kw_list.update(self.LANG_KEYWORDS[lang])
-            # Thêm từ SYNTAX_INFO (dùng chung cho panel và suggest)
-            if lang in SYNTAX_INFO:
-                parts = SYNTAX_INFO[lang].split(",")
-                kw_list.update([p.strip() for p in parts if p.strip()])
             
-            # Map 'cpp' -> 'c' / 'c++' keywords nếu cần
-            if lang == "cpp":
-                for alt in ["c", "c++"]:
-                    if alt in SYNTAX_INFO:
-                        parts = SYNTAX_INFO[alt].split(",")
-                        kw_list.update([p.strip() for p in parts if p.strip()])
+            # Calculate line and character position for LSP server
+            line_num = text[:cursor_pos].count('\n')
+            lines_before_cursor = text[:cursor_pos].split('\n')
+            char_in_line = len(lines_before_cursor[-1]) if lines_before_cursor else 0
+            
+            # TRY LSP EXTENSION FIRST
+            try:
+                from extension_integration import get_lsp_aware_suggestions
+                if hasattr(self, 'extension_hooks') and self.extension_hooks:
+                    lsp_suggestions = get_lsp_aware_suggestions(lang, prefix, self.extension_hooks, text, line_num, char_in_line)
+                    if lsp_suggestions:
+                        logger.debug(f"Using LSP suggestions for {lang}: {len(lsp_suggestions)} items")
+                        for lsp_kw in lsp_suggestions:
+                            kw_suggestions.append((lsp_kw, lsp_kw))
+            except Exception as e:
+                logger.debug(f"LSP suggestions error: {e}")
+            
+            # FALLBACK TO DEFAULT SYNTAX_INFO
+            if not kw_suggestions:
+                # Prioritize standard set in LANG_KEYWORDS
+                if lang in self.LANG_KEYWORDS:
+                    kw_list.update(self.LANG_KEYWORDS[lang])
+                # Add from SYNTAX_INFO (used for both panel and suggestion)
+                if lang in SYNTAX_INFO:
+                    parts = SYNTAX_INFO[lang].split(",")
+                    kw_list.update([p.strip() for p in parts if p.strip()])
+                
+                # Map 'cpp' -> 'c'/'c++' keywords if needed
+                if lang == "cpp":
+                    for alt in ["c", "c++"]:
+                        if alt in SYNTAX_INFO:
+                            parts = SYNTAX_INFO[alt].split(",")
+                            kw_list.update([p.strip() for p in parts if p.strip()])
 
-            for kw in kw_list:
-                if kw.lower().startswith(prefix.lower()):
-                    kw_suggestions.append((kw, kw))
+                for kw in kw_list:
+                    if kw.lower().startswith(prefix.lower()):
+                        kw_suggestions.append((kw, kw))
 
-        # 2. Thêm Identifier từ buffer
+        # 2. Add identifiers from buffer
         for typ, sym_set in symbols.items():
             for real_name in sym_set:
                 if real_name.lower().startswith(prefix.lower()):
                     sym_suggestions.append((real_name, real_name))
 
-        # Ưu tiên symbols (không phải keyword) gần con trỏ (±80 dòng)
+        # Prioritize symbols (non-keywords) near cursor (±80 lines)
         recent_lines = lines[max(0, current_line-80):current_line+80]
         recent_text = '\n'.join(recent_lines)
         recent_symbols = [s for s in sym_suggestions if s[0] in recent_text]
 
-        # Kết hợp ưu tiên: Symbols gần -> Symbols khác -> Keywords, loại trùng, giới hạn
-        final = list(dict.fromkeys(recent_symbols + sym_suggestions + kw_suggestions))[:40]
-        return final
+        # Combine priorities: Near symbols -> Other symbols -> Keywords, remove duplicates, limit
+        final = list(dict.fromkeys(recent_symbols + sym_suggestions + kw_suggestions))
+        
+        # 3. Add snippets from extensions
+        ext_snippets = getattr(self, "extension_snippets", {}).get(lang, [])
+        for prefix_snip, body, desc in ext_snippets:
+            if prefix_snip.lower().startswith(prefix.lower()):
+                # Return (insert_text, display_label)
+                # UserRole contains insert_text, DisplayRole contains display_label
+                final.insert(0, (body, f"[EXT] {prefix_snip} ({desc})"))
+
+        return final[:40]
 
 
     def _resolve_python_local_import_files(self, current_file_path: str, text: str) -> list[str]:
@@ -272,8 +338,8 @@ class Main(QMainWindow):
                 seen.add(p)
                 out.append(p)
         return out
-    def get_buffer_symbols_cpp(self, text: str, cursor_pos: int, prefix: str) -> list[tuple[str, str]]:
-        """Phân loại và lấy tất cả symbols có trong file C/C++, ưu tiên theo ngữ cảnh con trỏ"""
+    def get_buffer_symbols_cpp(self, text: str, cursor_pos: int, prefix: str, lang: str = "cpp") -> list[tuple[str, str]]:
+        """Phân loại và lấy tất cả symbols có trong file C/C++, ưu tiên theo ngữ cảnh cursor"""
         import re
         from collections import defaultdict
 
@@ -281,7 +347,7 @@ class Main(QMainWindow):
         cpp_keywords = self.LANG_KEYWORDS.get('cpp', set())
 
         lines = text.splitlines()
-        current_line = text[:cursor_pos].count('\n')  # dòng hiện tại của con trỏ
+        current_line = text[:cursor_pos].count('\n')  # current line of cursor
 
         in_class = False
         scope_level = 0
@@ -292,10 +358,10 @@ class Main(QMainWindow):
             if not stripped:
                 continue
 
-            # Theo dõi scope {}
+            # Track scope {}
             scope_level += line.count('{') - line.count('}')
 
-            # Phát hiện class/struct
+            # Detect class/struct
             if re.match(r'^\s*(class|struct)\s+([a-zA-Z_][a-zA-Z0-9_]*)', stripped):
                 match = re.search(r'(class|struct)\s+([a-zA-Z_][a-zA-Z0-9_]*)', stripped)
                 if match:
@@ -304,7 +370,7 @@ class Main(QMainWindow):
                     in_class = True
                     continue
 
-            # Phát hiện hàm / method
+            # Detect function/method
             func_pattern = r'^\s*(?:[\w:]+\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)\s*(const)?\s*(?:::\s*[a-zA-Z_][a-zA-Z0-9_]*)*\s*\{?'
             if re.match(func_pattern, stripped):
                 match = re.search(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', stripped)
@@ -314,7 +380,7 @@ class Main(QMainWindow):
                     in_function = True
                     continue
 
-            # Phát hiện biến (global, member, local, parameter)
+            # Detect variables (global, member, local, parameter)
             var_pattern = r'(?:const\s+)?(?:unsigned\s+)?(?:\w+(?:\s*\*|\s*&)?\s+)+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=|[;,)])'
             matches = re.finditer(var_pattern, line)
             for match in matches:
@@ -328,7 +394,7 @@ class Main(QMainWindow):
                 else:
                     symbols['local_var'].add(var_name)
 
-            # Phát hiện parameter trong hàm (nằm trong dấu ngoặc)
+            # Detect function parameters (within parentheses)
             if '(' in line and ')' in line:
                 param_part = re.search(r'\(([^)]*)\)', line)
                 if param_part:
@@ -338,11 +404,11 @@ class Main(QMainWindow):
                         if p and p not in cpp_keywords:
                             symbols['parameter'].add(p)
 
-            # Phát hiện include / using namespace (gợi ý tên header hoặc namespace)
+            # Detect include/using namespace (suggest header or namespace names)
             if '#include' in line:
                 match = re.search(r'#include\s*[<"]?([^>"]+)[>"]?', line)
                 if match:
-                    header = match.group(1).split('/')[-1].split('.')[0]  # chỉ lấy tên file/header
+                    header = match.group(1).split('/')[-1].split('.')[0]  # Extract header/file name only
                     symbols['include'].add(header)
 
             if 'using namespace' in line:
@@ -351,37 +417,62 @@ class Main(QMainWindow):
                     ns = match.group(1)
                     symbols['namespace'].add(ns)
 
-        # Lọc theo prefix
+        # Filter by prefix
         kw_suggestions = []
         sym_suggestions = []
         
-        # 1. Thêm Keywords
+        # Calculate line and character position for LSP server
+        line_num = text[:cursor_pos].count('\n')
+        lines_before_cursor = text[:cursor_pos].split('\n')
+        char_in_line = len(lines_before_cursor[-1]) if lines_before_cursor else 0
+        
+        # 1. Add Keywords
         for kw in cpp_keywords:
             if kw.lower().startswith(prefix.lower()):
                 kw_suggestions.append((kw, kw))
         
-        # Thêm từ SYNTAX_INFO cho c/c++
-        for alt in ["c", "c++"]:
-            if alt in SYNTAX_INFO:
-                parts = SYNTAX_INFO[alt].split(",")
-                for p in parts:
-                    p = p.strip()
-                    if p and p.lower().startswith(prefix.lower()):
-                        kw_suggestions.append((p, p))
+        # TRY LSP EXTENSION FIRST
+        try:
+            from extension_integration import get_lsp_aware_suggestions
+            if hasattr(self, 'extension_hooks') and self.extension_hooks:
+                lsp_suggestions = get_lsp_aware_suggestions(lang, prefix, self.extension_hooks, text, line_num, char_in_line)
+                if lsp_suggestions:
+                    logger.debug(f"Using LSP suggestions for {lang}: {len(lsp_suggestions)} items")
+                    for lsp_kw in lsp_suggestions:
+                        kw_suggestions.insert(0, (lsp_kw, lsp_kw))
+        except Exception as e:
+            logger.debug(f"LSP suggestions error for C++: {e}")
+        
+        # FALLBACK TO SYNTAX_INFO
+        if not any(s for s in kw_suggestions if 'LSP' not in str(s)):
+            # Add from SYNTAX_INFO for C/C++
+            for alt in ["c", "c++"]:
+                if alt in SYNTAX_INFO:
+                    parts = SYNTAX_INFO[alt].split(",")
+                    for p in parts:
+                        p = p.strip()
+                        if p and p.lower().startswith(prefix.lower()):
+                            kw_suggestions.append((p, p))
 
-        # 2. Thêm Symbols
+        # 2. Add Symbols
         for typ, sym_set in symbols.items():
             for s in sym_set:
                 if s.lower().startswith(prefix.lower()):
                     sym_suggestions.append((s, s))
 
-        # Ưu tiên symbols (không phải keyword) gần con trỏ (trong khoảng ±50 dòng)
+        # Prioritize symbols (non-keywords) near cursor (within ±50 lines)
         recent_lines = lines[max(0, current_line-50):current_line+50]
         recent_text = '\n'.join(recent_lines)
         recent_symbols = [s for s in sym_suggestions if s[0] in recent_text]
 
-        # Kết hợp ưu tiên: Symbols gần -> Symbols khác -> Keywords, loại trùng
+        # Combine priorities: Near symbols -> Other symbols -> Keywords, remove duplicates
         final = list(dict.fromkeys(recent_symbols + sym_suggestions + kw_suggestions))
+        
+        # 3. Add snippets from extensions for cpp
+        ext_snippets = getattr(self, "extension_snippets", {}).get("cpp", [])
+        for prefix_snip, body, desc in ext_snippets:
+            if prefix_snip.lower().startswith(prefix.lower()):
+                final.insert(0, (body, f"[EXT] {prefix_snip} ({desc})"))
 
         return final[:40]
 
@@ -392,6 +483,68 @@ class Main(QMainWindow):
             line = cursor.blockNumber() + 1
             col = cursor.columnNumber() + 1
             self.statusBar.showMessage(f"Ln: {line}, Col: {col}")
+
+    def select_all_text(self):
+        if self.tabFile.currentWidget():
+            editor = self.tabFile.currentWidget()
+            editor.selectAll()
+
+    def copy_text(self):
+        if self.tabFile.currentWidget():
+            editor = self.tabFile.currentWidget()
+            cursor = editor.textCursor()
+            if cursor.hasSelection():
+                selected_text = cursor.selectedText()
+                QApplication.clipboard().setText(selected_text)
+                self.statusBar.showMessage("Selected text copied to clipboard", 2000)
+            else:
+                self.statusBar.showMessage("No text selected to copy", 2000)
+
+    def paste_text(self):
+        if self.tabFile.currentWidget():
+            editor = self.tabFile.currentWidget()
+            clipboard_text = QApplication.clipboard().text()
+            cursor = editor.textCursor()
+            cursor.insertText(clipboard_text)
+            self.statusBar.showMessage("Clipboard text pasted", 2000)
+
+    def KeyPressEvent(self):
+        self.shortcut = []
+
+        shortcut_select_all = QShortcut(QKeySequence("Ctrl+A"), self)
+        shortcut_select_all.activated.connect(self.select_all_text)
+        self.shortcut.append(shortcut_select_all)
+
+        shortcut_copy = QShortcut(QKeySequence("Ctrl+C"), self)
+        shortcut_copy.activated.connect(self.copy_text)
+        self.shortcut.append(shortcut_copy)
+
+        shortcut_paste = QShortcut(QKeySequence("Ctrl+V"), self)
+        shortcut_paste.activated.connect(self.paste_text)
+        self.shortcut.append(shortcut_paste)
+
+        shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
+        shortcut_save.activated.connect(self.save_file)
+        self.shortcut.append(shortcut_save)
+
+        shortcut_save_as = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
+        shortcut_save_as.activated.connect(self.save_as_file)
+        self.shortcut.append(shortcut_save_as)
+
+        shortcut_exit = QShortcut(QKeySequence("Alt+F4"), self)
+        shortcut_exit.activated.connect(self.close)
+        self.shortcut.append(shortcut_exit)
+
+        shortcut_run = QShortcut(QKeySequence("F5"), self)
+        shortcut_run.activated.connect(self.run_current_file)
+        self.shortcut.append(shortcut_run)
+
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
 
     def __init__(self):
         super().__init__()
@@ -569,104 +722,30 @@ class Main(QMainWindow):
         self.syntax_timer.timeout.connect(self.update_syntax_panel)
         
         config = self._load_config()
+        self.theme_color = config.get("theme_color", "#1e1e1e")
+        self.language = config.get("language", "vi")
         self.auto_save_enabled = config.get("auto_save", False)
+        
+        # Snippets storage for extensions
+        self.extension_snippets = defaultdict(list)
+        
+        # Marketplace dialog (created on demand)
+        self.marketplace_dialog = None
+        
+        # Find functionality variables
+        self.find_matches = []
+        self.current_find_index = 0
+        self.find_format = QTextCharFormat()
+        self.find_format.setBackground(QColor("#FFFF00"))  # Yellow highlight
+        self.find_format.setForeground(QColor("#000000"))  # Black text
+        
+        # Extension hooks (for runtime integration)
+        self.extension_hooks = None
+        
         self.initUI()
-
-    def show_console(self):
-        if hasattr(self, 'terminal_tab') and self.terminal_tab is not None:
-            self.extension_container.show()
-            self.extension_tabs.setCurrentWidget(self.terminal_tab)
-            return
-
-        self.terminal_tab = QWidget()
-        terminal_layout = QVBoxLayout(self.terminal_tab)
-        terminal_layout.setContentsMargins(0, 0, 0, 0)
-        terminal_layout.setSpacing(0)
-
-        header = QWidget()
-        header.setFixedHeight(24)
-        header.setStyleSheet("background-color: #252526;")
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(8, 0, 4, 0)
-        header_layout.setSpacing(0)
-
-        header_label = QLabel("Terminal")
-        header_label.setStyleSheet("color: #d4d4d4; font-size: 12px;")
-        header_layout.addWidget(header_label)
-        header_layout.addStretch()
-
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(20, 20)
-        close_btn.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                color: #858585;
-                border: none;
-                font-size: 14px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #c42b1c;
-                color: #ffffff;
-                border-radius: 2px;
-            }
-        """)
-        close_btn.clicked.connect(self.hide_console)
-        header_layout.addWidget(close_btn)
-        terminal_layout.addWidget(header)
-
-        main_window = self
-        class ConsoleWidget(QPlainTextEdit):
-            def __init__(self, parent=None):
-                super().__init__(parent)
-                self.setFont(QFont("Consolas", 11))
-                self.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; border: none; padding: 4px;")
-                self._prompt_pos = 0  
-
-            def append_output(self, text):
-                self.moveCursor(QTextCursor.End)
-                self.insertPlainText(text)
-                self._prompt_pos = self.textCursor().position()
-                self.moveCursor(QTextCursor.End)
-                self.ensureCursorVisible()
-
-            def keyPressEvent(self, event):
-                cursor = self.textCursor()
-
-                if cursor.position() < self._prompt_pos:
-                    if event.key() not in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down,
-                                           Qt.Key_Home, Qt.Key_End, Qt.Key_PageUp, Qt.Key_PageDown):
-                        self.moveCursor(QTextCursor.End)
-
-                if event.key() == Qt.Key_Backspace:
-                    if cursor.position() <= self._prompt_pos:
-                        return
-
-                if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-                    full_text = self.toPlainText()
-                    input_text = full_text[self._prompt_pos:]
-                    self.moveCursor(QTextCursor.End)
-                    self.insertPlainText("\n")
-                    self._prompt_pos = self.textCursor().position()
-
-                    if main_window.process and main_window.process.state() == QProcess.Running:
-                        main_window.process.write((input_text + "\n").encode("utf-8"))
-                    return
-
-                super().keyPressEvent(event)
-
-        self.terminal_output = ConsoleWidget()
-        terminal_layout.addWidget(self.terminal_output)
-
-        self.extension_tabs.addTab(self.terminal_tab, "Terminal")
-        self.extension_container.show()
-        self.extension_tabs.setCurrentWidget(self.terminal_tab)
-
-    def hide_console(self):
-        """Ẩn panel terminal và dừng process nếu đang chạy."""
-        self.stop_process()
-        self.extension_container.hide()
-
+        
+        # Load and apply extensions (must be after initUI)
+        self._load_extensions()
 
     def initUI(self):
         central_widget = QWidget()
@@ -685,15 +764,22 @@ class Main(QMainWindow):
         self.open_action = self.file_menu.addAction("Open")
         self.new_action = self.file_menu.addAction("New")
         self.save_action = self.file_menu.addAction("Save")
+        self.save_action.setShortcuts(QKeySequence("Ctrl+S"))
         self.save_as_action = self.file_menu.addAction("Save As")
+        self.save_as_action.setShortcuts(QKeySequence("Ctrl+Shift+S"))
         self.rename_action = self.file_menu.addAction("Rename")
         self.delete_action = self.file_menu.addAction("Delete")
+        
+        self.file_menu.addSeparator()
+        self.find_action = self.file_menu.addAction("Find")
+        self.find_action.setShortcut(QKeySequence("Ctrl+F"))
+        
         self.exit_action = self.file_menu.addAction("Exit")
+        self.exit_action.setShortcut(QKeySequence("Alt+F4"))
         self.run_action = self.run_menu.addAction("Run Current File")
+        self.run_action.setShortcut(QKeySequence("F5"))
         self.settings_action = self.settings_menu.addAction("Preferences")
-        self.console_action = self.run_menu.addAction("Console")
 
-        self.console_action.triggered.connect(self.show_console)
         self.open_action.triggered.connect(self.open_file)
         self.new_action.triggered.connect(self.new_file)
         self.save_action.triggered.connect(self.save_file)
@@ -702,6 +788,7 @@ class Main(QMainWindow):
         self.exit_action.triggered.connect(self.exit_app)
         self.about_action.triggered.connect(self.about_app)
         self.rename_action.triggered.connect(self.rename_file)
+        self.find_action.triggered.connect(self.show_find_widget)
         
         self.file_menu.addSeparator()
         self.auto_save_action = self.file_menu.addAction("Auto Save")
@@ -713,6 +800,18 @@ class Main(QMainWindow):
         self.run_action.triggered.connect(self.run_current_file)
         self.settings_action.triggered.connect(self.open_settings)
         self.multicore_action.triggered.connect(self.run_multicore)
+
+        # Extensions Menu
+        self.ext_menu = self.menubar.addMenu("Extensions")
+        self.market_action = self.ext_menu.addAction("Marketplace")
+        self.market_action.triggered.connect(self.show_marketplace)
+        
+        self.ext_menu.addSeparator()
+        self.toggle_ext_panel_action = self.ext_menu.addAction("Toggle Extension Panel (Ctrl+Shift+E)")
+        self.toggle_ext_panel_action.setShortcut("Ctrl+Shift+E")
+        self.toggle_ext_panel_action.triggered.connect(self.toggle_extension_panel)
+        self.toggle_ext_panel_action.setCheckable(True)
+        self.toggle_ext_panel_action.setChecked(False)  # Sidebar starts hidden
         
         self.tabFile = QTabWidget(self)
         self.tabFile.setTabsClosable(True)
@@ -725,30 +824,203 @@ class Main(QMainWindow):
         tab_bar.setExpanding(False)
         tab_bar.setElideMode(Qt.ElideNone)
         tab_bar.setUsesScrollButtons(True)
+        # Store tab bar for later width adjustments
+        self.tab_bar = tab_bar
         
         self.mainlayout.addWidget(self.menubar, 0)
-        self.mainlayout.addWidget(self.tabFile, 1)
-
+        
+        # Marketplace widget (not displayed directly - accessed via menu)
+        self.marketplace = MarketplaceWidget(self)
+        self.marketplace.theme_changed.connect(self.apply_ide_theme)
+        self.marketplace.snippets_loaded.connect(self.register_extension_snippets)
+        self.marketplace.setStyleSheet("background-color: #1e1e1e;")
+        
+        # --- Main Editor Area (Vertical Splitter) ---
+        self.splitter = QSplitter(Qt.Vertical)
+        self.splitter.setOpaqueResize(True)
+        self.splitter.addWidget(self.tabFile)
+        
         self.syntax_view = QListWidget(self)
         self.syntax_view.setFixedHeight(120)
         self.syntax_view.hide()
         self.syntax_view.itemDoubleClicked.connect(self.insert_syntax_from_list)
-        self.mainlayout.addWidget(self.syntax_view, 0)
-
-        self.extension_container = QWidget(self)
-        ext_layout = QVBoxLayout(self.extension_container)
-        ext_layout.setContentsMargins(0, 0, 0, 0)
-        ext_layout.setSpacing(2)
-        self.extension_tabs = QTabWidget(self.extension_container)
-        ext_layout.addWidget(self.extension_tabs)
-        self.extension_container.setFixedHeight(200)
-        self.extension_container.hide()
-        self.mainlayout.addWidget(self.extension_container, 0)
+        self.splitter.addWidget(self.syntax_view)
+        
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 0)
+        
+        # --- Sidebar (Marketplace content area, dark background) ---
+        sidebar = QWidget()
+        sidebar.setStyleSheet("background-color: #1e1e1e; border-right: 1px solid #3c3c3c;")
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(0)
+        
+        # Sidebar header
+        sidebar_header = QWidget()
+        sidebar_header.setFixedHeight(35)
+        sidebar_header.setStyleSheet("background-color: #252526; border-bottom: 1px solid #3c3c3c;")
+        header_layout = QHBoxLayout(sidebar_header)
+        header_layout.setContentsMargins(8, 4, 4, 4)
+        header_layout.setSpacing(0)
+        
+        self.sidebar_title = QLabel("Marketplace")
+        self.sidebar_title.setStyleSheet("font-weight: bold; color: #cccccc; font-size: 13px;")
+        header_layout.addWidget(self.sidebar_title)
+        header_layout.addStretch()
+        
+        sidebar_close_btn = QPushButton("✕")
+        sidebar_close_btn.setFixedSize(24, 24)
+        sidebar_close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #858585;
+                border: none;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background-color: #c42b1c;
+                color: #ffffff;
+                border-radius: 2px;
+            }
+        """)
+        sidebar_close_btn.clicked.connect(self.toggle_extension_panel)
+        header_layout.addWidget(sidebar_close_btn)
+        
+        sidebar_layout.addWidget(sidebar_header)
+        
+        # Marketplace widget in sidebar
+        self.marketplace.setMinimumHeight(400)
+        sidebar_layout.addWidget(self.marketplace, 1)
+        
+        self.sidebar = sidebar
+        self.sidebar.setMinimumWidth(250)
+        self.sidebar.setMaximumWidth(500)
+        self.sidebar.hide()  # Hidden by default - shows marketplace when sidebar is shown
+        
+        # --- Main Horizontal Layout: Sidebar | Editor ---
+        main_container = QWidget()
+        main_layout = QHBoxLayout(main_container)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        main_layout.addWidget(self.sidebar)
+        main_layout.addWidget(self.splitter, 1)
+        
+        # --- Find Widget (Search bar) ---
+        self.find_widget = QWidget()
+        self.find_widget.setFixedHeight(32)
+        self.find_widget.setStyleSheet("background-color: #252526; border-top: 1px solid #3c3c3c;")
+        find_layout = QHBoxLayout(self.find_widget)
+        find_layout.setContentsMargins(4, 4, 4, 4)
+        find_layout.setSpacing(4)
+        
+        # Find input field (left)
+        self.find_input = QLineEdit()
+        self.find_input.setPlaceholderText("Find in current file...")
+        self.find_input.setStyleSheet("""
+            QLineEdit {
+                background-color: #3c3c3c;
+                color: #d4d4d4;
+                border: 1px solid #555555;
+                border-radius: 3px;
+                padding: 4px;
+                font-size: 12px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #007acc;
+            }
+        """)
+        self.find_input.textChanged.connect(self.on_find_text_changed)
+        self.find_input.returnPressed.connect(self.find_next)
+        find_layout.addWidget(self.find_input)
+        
+        # Navigation buttons
+        prev_btn = QPushButton("◀")
+        prev_btn.setFixedSize(24, 24)
+        prev_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3c3c3c;
+                color: #d4d4d4;
+                border: 1px solid #555555;
+                border-radius: 2px;
+                font-size: 10px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+            }
+            QPushButton:pressed {
+                background-color: #2a2a2a;
+            }
+        """)
+        prev_btn.clicked.connect(self.find_previous)
+        find_layout.addWidget(prev_btn)
+        
+        next_btn = QPushButton("▶")
+        next_btn.setFixedSize(24, 24)
+        next_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3c3c3c;
+                color: #d4d4d4;
+                border: 1px solid #555555;
+                border-radius: 2px;
+                font-size: 10px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+            }
+            QPushButton:pressed {
+                background-color: #2a2a2a;
+            }
+        """)
+        next_btn.clicked.connect(self.find_next)
+        find_layout.addWidget(next_btn)
+        
+        # Counter label (right) - shows position/total
+        self.find_counter = QLabel("0/0")
+        self.find_counter.setStyleSheet("color: #858585; font-size: 11px;")
+        self.find_counter.setMinimumWidth(40)
+        find_layout.addWidget(self.find_counter)
+        
+        # Close button (right)
+        close_find_btn = QPushButton("✕")
+        close_find_btn.setFixedSize(24, 24)
+        close_find_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #858585;
+                border: none;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #c42b1c;
+                color: #ffffff;
+                border-radius: 2px;
+            }
+        """)
+        close_find_btn.clicked.connect(self.hide_find_widget)
+        find_layout.addWidget(close_find_btn)
+        
+        self.find_widget.hide()  # Hidden by default - buttons only show when find is opened
+        self.find_widget.setVisible(False)  # Extra ensure it's hidden
+        
+        self.mainlayout.addWidget(self.find_widget, 0)
+        self.mainlayout.addWidget(main_container, 1)
+        
+        # Initialize terminal widget
+        self.terminal_container = self.create_terminal_widget()
+        self.splitter.addWidget(self.terminal_container)
+        self.terminal_container.hide()  # Hidden by default
         
         self.make_json_file()
         self.check_no_file()
         self.auto_open_file_recent()
         self.auto_check_current_file_used()
+        
+        # Load extensions installed
+        QTimer.singleShot(500, self.marketplace.load_all_contributions)
 
         
 
@@ -806,53 +1078,53 @@ class Main(QMainWindow):
                 self.lang = lang
                 self.highlighting_rules = []
 
-                # Format cho các loại
-                keyword_format = QTextCharFormat()
-                keyword_format.setForeground(QColor("#569cd6"))  # xanh dương
-                keyword_format.setFontWeight(QFont.Bold)
+                # Format for different types
+                self.keyword_format = QTextCharFormat()
+                self.keyword_format.setForeground(QColor("#569cd6"))  # Blue
+                self.keyword_format.setFontWeight(QFont.Bold)
 
-                function_format = QTextCharFormat()
-                function_format.setForeground(QColor("#dcdcaa")) # vàng nhạt cho hàm
+                self.function_format = QTextCharFormat()
+                self.function_format.setForeground(QColor("#dcdcaa")) # Light yellow for functions
 
-                class_format = QTextCharFormat()
-                class_format.setForeground(QColor("#4ec9b0")) # xanh ngọc cho class
+                self.class_format = QTextCharFormat()
+                self.class_format.setForeground(QColor("#4ec9b0")) # Cyan for classes
 
-                number_format = QTextCharFormat()
-                number_format.setForeground(QColor("#b5cea8")) # xanh lơ cho số
+                self.number_format = QTextCharFormat()
+                self.number_format.setForeground(QColor("#b5cea8")) # Green for numbers
 
-                string_format = QTextCharFormat()
-                string_format.setForeground(QColor("#ce9178"))  # cam
+                self.string_format = QTextCharFormat()
+                self.string_format.setForeground(QColor("#ce9178"))  # cam
 
-                comment_format = QTextCharFormat()
-                comment_format.setForeground(QColor("#6a9955"))  # xanh lá đậm cho chú thích
+                self.comment_format = QTextCharFormat()
+                self.comment_format.setForeground(QColor("#6a9955"))  # Dark green for comments
 
-                brace_format = QTextCharFormat()
-                brace_format.setForeground(QColor("#ffd700"))  # vàng cho ngoặc
+                self.brace_format = QTextCharFormat()
+                self.brace_format.setForeground(QColor("#ffd700"))  # Gold for brackets
 
-                identifier_format = QTextCharFormat()
-                identifier_format.setForeground(QColor("#ffffff"))  # xanh lá/sáng (biến chung)
+                self.identifier_format = QTextCharFormat()
+                self.identifier_format.setForeground(QColor("#ffffff"))  # White for identifiers
 
-                escape_format = QTextCharFormat()
-                escape_format.setForeground(QColor("#d7ba7d"))  # vàng đậm cho escape sequence
+                self.escape_format = QTextCharFormat()
+                self.escape_format.setForeground(QColor("#d7ba7d"))  # Dark yellow for escape sequences
 
                 # ========================================================
-                # Thứ tự các rule RẤT QUAN TRỌNG:
-                # Trong QSyntaxHighlighter, rule được add sau sẽ GHI ĐÈ
-                # lên màu của các rule trước nếu trùng vị trí chữ.
+                # Rule order is VERY IMPORTANT:
+                # In QSyntaxHighlighter, later added rules will override earlier ones
+                # Later rules will override earlier ones if they overlap.
                 # ========================================================
 
-                # 1. Identifier chung & Số (Mức ưu tiên thấp nhất)
-                self.highlighting_rules.append((re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b'), identifier_format))
-                self.highlighting_rules.append((re.compile(r'\b\d+(\.\d+)?\b'), number_format))
+                # 1. General identifiers and numbers (lowest priority)
+                self.highlighting_rules.append((re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b'), self.identifier_format))
+                self.highlighting_rules.append((re.compile(r'\b\d+(\.\d+)?\b'), self.number_format))
                 # import
                 
-                # 2. Class (Thường viết hoa chữ cái đầu)
-                self.highlighting_rules.append((re.compile(r'\b[A-Z][a-zA-Z0-9_]*\b'), class_format))
+                # 2. Classes (usually capitalized)
+                self.highlighting_rules.append((re.compile(r'\b[A-Z][a-zA-Z0-9_]*\b'), self.class_format))
 
-                # 3. Function (Từ theo sau bởi dấu ngoặc mở)
-                self.highlighting_rules.append((re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*(?=\s*\()'), function_format))
+                # 3. Functions (word followed by opening parenthesis)
+                self.highlighting_rules.append((re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*(?=\s*\()'), self.function_format))
 
-                # 4. Từ khóa (Sẽ đè lên các Identifier ở trên để nó không bị nhầm thành màu biến)
+                # 4. Keywords (will override identifiers above to prevent confusion)
                 keywords = [
                     'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'return', 'class', 'struct',
                     'int', 'float', 'double', 'char', 'void', 'bool', 'const', 'static', 'public', 'private',
@@ -860,31 +1132,66 @@ class Main(QMainWindow):
                 ]
                 for word in keywords:
                     pattern = r'\b' + word + r'\b'
-                    self.highlighting_rules.append((re.compile(pattern), keyword_format))
+                    self.highlighting_rules.append((re.compile(pattern), self.keyword_format))
 
-                # 5. Dấu ngoặc (Braces)
-                self.highlighting_rules.append((re.compile(r'[\{\}\[\]\(\)]'), brace_format))
+                # 5. Braces
+                self.highlighting_rules.append((re.compile(r'[\{\}\[\]\(\)]'), self.brace_format))
 
                 # 6. String Prefix (f, r, b, u)
-                self.highlighting_rules.append((re.compile(r'\b[fFrRbBuU]+(?=["\'])'), keyword_format))
+                self.highlighting_rules.append((re.compile(r'\b[fFrRbBuU]+(?=["\'])'), self.keyword_format))
 
                 # 6.1 String
-                self.highlighting_rules.append((re.compile(r'"[^"\\]*(\\.[^"\\]*)*"'), string_format))
-                self.highlighting_rules.append((re.compile(r"'[^'\\]*(\\.[^'\\]*)*'"), string_format))
-                self.highlighting_rules.append((re.compile(r'#include\s*(<[^>]+>)'), string_format, 1))
-                self.highlighting_rules.append((re.compile(r'#include'), keyword_format))
+                self.highlighting_rules.append((re.compile(r'"[^"\\]*(\\.[^"\\]*)*"'), self.string_format))
+                self.highlighting_rules.append((re.compile(r"'[^'\\]*(\\.[^'\\]*)*'"), self.string_format))
+                self.highlighting_rules.append((re.compile(r'#include\s*(<[^>]+>)'), self.string_format, 1))
+                self.highlighting_rules.append((re.compile(r'#include'), self.keyword_format))
 
                 # 6.2 F-String Post-Processing
                 self.highlighting_rules.append((re.compile(r'f"[^"\\]*(\\.[^"\\]*)*"', re.IGNORECASE), "f-string"))
                 self.highlighting_rules.append((re.compile(r"f'[^'\\]*(\\.[^'\\]*)*'", re.IGNORECASE), "f-string"))
 
                 # 6.3 Escape sequences
-                self.highlighting_rules.append((re.compile(r'\\[\\\'"nrtvfa0-7xUu]'), escape_format))
+                self.highlighting_rules.append((re.compile(r'\\[\\\'"nrtvfa0-7xUu]'), self.escape_format))
 
-                self.highlighting_rules.append((re.compile(r'//.*'), comment_format))
-                self.highlighting_rules.append((re.compile(r'/\*.*?\*/', re.DOTALL), comment_format))
+                self.highlighting_rules.append((re.compile(r'//.*'), self.comment_format))
+                self.highlighting_rules.append((re.compile(r'/\*.*?\*/', re.DOTALL), self.comment_format))
                 if self.lang in ['python', 'nim', 'yaml', 'sh', 'bash', 'rb']:
-                    self.highlighting_rules.append((re.compile(r'#.*'), comment_format))
+                    self.highlighting_rules.append((re.compile(r'#.*'), self.comment_format))
+                
+                # TRY TO APPLY EXTENSION HIGHLIGHTER
+                # Access main window's extension hooks
+                try:
+                    from extension_integration import get_syntax_highlighter_for_language, load_textmate_grammar, apply_textmate_grammar_to_highlighter
+                    # This will be set by main window later
+                    self.extension_hooks_ref = None
+                except Exception as e:
+                    logger.debug(f"Extension highlighter not available: {e}")
+
+            def apply_extension_highlighter(self, extension_hooks):
+                """Apply syntax highlighting rules from extension grammar if available."""
+                if not extension_hooks or not self.lang:
+                    return
+                
+                try:
+                    from extension_integration import get_syntax_highlighter_for_language, load_textmate_grammar, apply_textmate_grammar_to_highlighter
+                    
+                    highlighter_ext = get_syntax_highlighter_for_language(self.lang, extension_hooks)
+                    if highlighter_ext:
+                        logger.info(f"Applying highlighter extension for {self.lang}")
+                        contributions = highlighter_ext.get("contributions", {})
+                        grammars = contributions.get("grammars", [])
+                        
+                        if grammars:
+                            # Load first grammar
+                            grammar_info = grammars[0]
+                            grammar_path = grammar_info.get("path", "")
+                            
+                            if grammar_path:
+                                grammar = load_textmate_grammar(grammar_path)
+                                if grammar:
+                                    apply_textmate_grammar_to_highlighter(self, grammar, self.lang)
+                except Exception as e:
+                    logger.debug(f"Failed to apply extension highlighter: {e}")
 
             def highlightBlock(self, text):
                 for rule in self.highlighting_rules:
@@ -903,15 +1210,15 @@ class Main(QMainWindow):
                                 inner_text = m2.group(1)
                                 inner_start = s_start + m2.start(1)
                                 
-                                self.setFormat(brace_start, 1, brace_format)
-                                self.setFormat(brace_end - 1, 1, brace_format)
+                                self.setFormat(brace_start, 1, self.brace_format)
+                                self.setFormat(brace_end - 1, 1, self.brace_format)
                                 
                                 for inner_rule in self.highlighting_rules:
                                     i_pattern = inner_rule[0]
                                     i_format = inner_rule[1]
                                     i_group = inner_rule[2] if len(inner_rule) > 2 else 0
                                     
-                                    if i_format in [string_format, comment_format, "f-string"]:
+                                    if i_format in [self.string_format, self.comment_format, "f-string"]:
                                         continue
                                         
                                     for m3 in i_pattern.finditer(inner_text):
@@ -1149,6 +1456,13 @@ class Main(QMainWindow):
         ext = os.path.splitext(file_path)[1].lower() if file_path else ""
         lang = self._get_lang_from_ext(ext)
         editor.highlighter = CodeHighlighter(editor.document(), lang)
+        
+        # Apply extension highlighter if available
+        if hasattr(self, 'extension_hooks') and self.extension_hooks:
+            try:
+                editor.highlighter.apply_extension_highlighter(self.extension_hooks)
+            except Exception as e:
+                logger.debug(f"Failed to apply extension highlighter: {e}")
 
         editor.textChanged.connect(lambda: self.auto_save_specific_editor(editor))
         editor.textChanged.connect(self.on_text_changed_for_syntax)
@@ -1175,6 +1489,18 @@ class Main(QMainWindow):
     def _load_config(self):
         path_json = self.get_json_path()
         config = {"file_used": {}, "theme_color": self.theme_color, "language": self.language}
+        
+        # Migrate old config from project directory if it exists
+        old_config_path = Path(__file__).resolve().parent / "config_VNCode.json"
+        if old_config_path.exists() and not path_json.exists():
+            try:
+                logger.info(f"Migrating config from {old_config_path} to {path_json}")
+                import shutil
+                shutil.copy2(old_config_path, path_json)
+                old_config_path.unlink()  # Delete old file after migration
+            except Exception as e:
+                logger.error(f"Config migration error: {e}")
+        
         if not path_json.exists() or path_json.stat().st_size == 0:
             return config
         try:
@@ -1186,16 +1512,18 @@ class Main(QMainWindow):
                         config["file_used"] = {}
                 return config
         except (json.JSONDecodeError, Exception) as e:
-            print(f"Config load error: {e}")
+            logger.error(f"Config load error: {e}")
             return config
 
     def _save_config(self, config):
         try:
             path_json = self.get_json_path()
+            # Ensure directory exists
+            path_json.parent.mkdir(parents=True, exist_ok=True)
             with open(path_json, "w", encoding='utf-8') as f:
-                json.dump(config, f, indent=4)
+                json.dump(config, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            print(f"Config save error: {e}")
+            logger.error(f"Config save error: {e}")
 
     def make_json_file(self):
         config = self._load_config()
@@ -1250,6 +1578,8 @@ class Main(QMainWindow):
                 
                 editor.setProperty("file_path", new_path)
                 self.tabFile.setTabText(idx, new_name)
+                self.adjust_tab_width(idx)
+                self.set_tab_icon(idx, new_path)
                 
                 config = self._load_config()
                 if old_path in config.get("file_used", {}):
@@ -1266,13 +1596,13 @@ class Main(QMainWindow):
         config = self._load_config()
         config["auto_save"] = checked
         self._save_config(config)
-        print(f"Auto-save is now {'ON' if checked else 'OFF'}")
+        logger.info(f"Auto-save is now {'ON' if checked else 'OFF'}")
 
     def about_app(self):
         if self.language == "en":
-            text = "VNCode IDE\nVersion 1.0\nAuthor: Nguyễn Trường Lâm\nEmail: nguyenvannghia1952tg@gmail.com\nteam: VNCore Lab"
+            text = "VNCode IDE\nVersion 1.1\nAuthor: Nguyễn Trường Lâm\nEmail: nguyenvannghia1952tg@gmail.com\nteam: VNCore Lab"
         else:
-            text = "VNCode IDE\nPhiên bản 1.0\nTác giả: Nguyễn Trường Lâm\nEmail: nguyenvannghia1952tg@gmail.com\nteam: VNCore Lab"
+            text = "VNCode IDE\nPhiên bản 1.1\nTác giả: Nguyễn Trường Lâm\nEmail: nguyenvannghia1952tg@gmail.com\nteam: VNCore Lab"
         QMessageBox.information(self, "About VNCode", text)
 
     def find_file_path(self, file_name):
@@ -1286,7 +1616,7 @@ class Main(QMainWindow):
     def on_editor_text_changed(self):
         """Triggered mỗi khi bất kỳ editor nào thay đổi nội dung"""
         if self.auto_save_enabled:
-            # Lưu ngay lập tức theo yêu cầu của người dùng
+            # Save immediately as requested by user
             self.auto_save_trigger()
 
     def auto_save_trigger(self):
@@ -1302,12 +1632,12 @@ class Main(QMainWindow):
             
         text = editor.toPlainText()
         try:
-            # Chỉ lưu nếu thực sự có thay đổi (tùy chọn, ở đây lưu luôn cho chắc)
+            # Only save if there are actual changes (optional, save anyway for safety)
             with open(file_path, "w", encoding='utf-8') as f:
                 f.write(text)
         
         except Exception as e:
-            print(f"Auto-save error: {e}")
+            logger.error(f"Auto-save error: {e}")
 
     def on_cursor_activity(self):
         if self.syntax_view:
@@ -1342,12 +1672,12 @@ class Main(QMainWindow):
             self.syntax_view.hide()
             return
 
-        # Lấy từ hiện tại tại vị trí cursor
+        # Get current word at cursor position
         cursor = editor.textCursor()
         cursor.select(QTextCursor.WordUnderCursor)
         current_word = cursor.selectedText().strip()
 
-        # Lọc keywords
+        # Filter keywords
         parts = info.split(",")
         keywords = [p.strip() for p in parts if p.strip()]
 
@@ -1399,6 +1729,80 @@ class Main(QMainWindow):
         
         self.check_no_file()
 
+    def get_file_icon(self, file_path):
+        """Get language icon for file based on extension"""
+        try:
+            if not file_path:
+                return None
+            
+            ext = os.path.splitext(file_path)[1].lower()
+            if not ext:
+                return None
+            
+            ext_to_icon = {
+                ".py": "python",
+                ".python": "python",
+                ".cpp": "cpp",
+                ".c": "c",
+                ".java": "java",
+                ".cs": "cs",
+                ".sql": "sql",
+                ".asm": "asm",
+                ".r": "r",
+                ".lua": "lua",
+                ".go": "go",
+                ".rs": "rs",
+                ".swift": "swift",
+                ".kt": "kt",
+                ".bat": "bat",
+                ".sh": "sh",
+                ".ps1": "ps1",
+            }
+            
+            icon_key = ext_to_icon.get(ext)
+            if not icon_key:
+                return None
+            
+            icon_path = ICON_LANGUESE.get(icon_key)
+            if icon_path and os.path.exists(icon_path):
+                return QIcon(icon_path)
+            
+            return None
+        except Exception as e:
+            logger.debug(f"Error loading file icon: {e}")
+            return None
+
+    def adjust_tab_width(self, index):
+        """Adjust tab width based on filename length - dynamically scales with filename"""
+        try:
+            tab_text = self.tabFile.tabText(index)
+            if not tab_text:
+                return
+            
+            min_width = 80
+            char_width = 6
+            calculated_width = min_width + (len(tab_text) * char_width)
+            
+            max_width = 300
+            final_width = min(calculated_width, max_width)
+            
+            self.tab_bar.setTabSizeHint(index, QSize(final_width, 30))
+            self.tab_bar.update()
+        except Exception as e:
+            logger.debug(f"Tab width adjustment error: {e}")
+    
+    def set_tab_icon(self, index, file_path):
+        """Set icon for tab based on file extension"""
+        try:
+            if not file_path:
+                return
+            
+            icon = self.get_file_icon(file_path)
+            if icon:
+                self.tabFile.setTabIcon(index, icon)
+        except Exception as e:
+            logger.debug(f"Error setting tab icon: {e}")
+
 
 
     def auto_open_file_recent(self):
@@ -1411,11 +1815,13 @@ class Main(QMainWindow):
                         content = f.read()
                     editor = self.create_editor(file_path, content)
                     
-                    self.tabFile.addTab(editor, file_name)
+                    tab_index = self.tabFile.addTab(editor, file_name)
+                    self.adjust_tab_width(tab_index)
+                    self.set_tab_icon(tab_index, file_path)
                     
                     opened_any = True
                 except Exception as e:
-                    print(f"Error opening recent file {file_path}: {e}")
+                    logger.error(f"Error opening recent file {file_path}: {e}")
         
         if opened_any:
             self.tabFile.setCurrentIndex(0)
@@ -1454,10 +1860,64 @@ class Main(QMainWindow):
         container = QWidget(self)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(0)
+        
+        # Terminal header with title and close button
+        header = QWidget()
+        header.setFixedHeight(30)
+        header.setStyleSheet("background-color: #252526; border-bottom: 1px solid #3c3c3c;")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 4, 4, 4)
+        header_layout.setSpacing(0)
+        
+        title = QLabel("Terminal")
+        title.setStyleSheet("font-weight: bold; color: #cccccc; font-size: 12px;")
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        
+        clear_btn = QPushButton("🗑️")
+        clear_btn.setFixedSize(24, 24)
+        clear_btn.setToolTip("Clear console")
+        clear_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #858585;
+                border: none;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #0e639c;
+                color: #ffffff;
+                border-radius: 2px;
+            }
+        """)
+        clear_btn.clicked.connect(lambda: self.terminal_output.clear() if self.terminal_output else None)
+        header_layout.addWidget(clear_btn)
+        
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(24, 24)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #858585;
+                border: none;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #c42b1c;
+                color: #ffffff;
+                border-radius: 2px;
+            }
+        """)
+        close_btn.clicked.connect(lambda: container.hide())
+        header_layout.addWidget(close_btn)
+        
+        layout.addWidget(header)
+        
         self.terminal_tabs = QTabWidget(container)
         self.terminal_output = QTextEdit(container)
         self.terminal_output.setReadOnly(True)
+        self.terminal_output.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; border: none; font-family: Consolas; font-size: 11px;")
         layout.addWidget(self.terminal_tabs, 0)
         layout.addWidget(self.terminal_output, 1)
         return container
@@ -1513,6 +1973,59 @@ class Main(QMainWindow):
         process.start()
         return process
 
+    def find_runner_for_file(self, file_path):
+        """
+        Find runner for file using priority chain:
+        1. Code-runner extension supporting this language
+        2. Another code-runner extension
+        3. Internal run syntax
+        4. None (error)
+        
+        Returns: (runner_type, runner_command, runner_name)
+            runner_type: "extension", "internal", or None
+            runner_command: built run command or internal syntax list
+            runner_name: display name of runner
+        """
+        try:
+            from extension_manager import get_extension_hooks
+            hooks = get_extension_hooks()
+        except ImportError:
+            hooks = None
+        
+        # Get file extension and language
+        ext = Path(file_path).suffix.lower()
+        lang = self.ext_to_lang.get(ext, "").lower()
+        
+        if hooks and lang:
+            # Priority 1: Code-runner extension supporting this language
+            all_runners = hooks.get_code_runner_extensions()
+            
+            # First, try to find extension with specific language support
+            for runner_ext in all_runners:
+                supported_langs = runner_ext.get("languages", [])
+                if lang in supported_langs:
+                    run_cmd = runner_ext.get("run_command")
+                    if run_cmd:
+                        logger.info(f"Found code-runner extension for {lang}: {runner_ext.get('displayName')}")
+                        return "extension", run_cmd, runner_ext.get("displayName")
+            
+            # Priority 2: Any code-runner extension with run_command
+            for runner_ext in all_runners:
+                run_cmd = runner_ext.get("run_command")
+                if run_cmd:
+                    logger.info(f"Using fallback code-runner extension: {runner_ext.get('displayName')}")
+                    return "extension", run_cmd, runner_ext.get("displayName")
+        
+        # Priority 3: Internal run syntax
+        run_syntax = TYPE_RUN_SYNTAX.get(ext)
+        if run_syntax:
+            logger.info(f"Using built-in runner for {lang}")
+            return "internal", run_syntax, "Built-in Runner"
+        
+        # Priority 4: Error
+        logger.warning(f"No runner found for {lang} ({ext})")
+        return None, None, None
+
     def run_current_file(self):
         if not self.tabFile.currentWidget():
             QMessageBox.warning(self, "Warning", "No file is open.")
@@ -1524,28 +2037,39 @@ class Main(QMainWindow):
             QMessageBox.warning(self, "Warning", "File chưa lưu. Save trước khi run.")
             return
 
-        # Đảm bảo console đã được tạo và hiển thị
-        self.show_console()
-
-        # Xác định extension và lấy lệnh chạy
-        ext = Path(file_path).suffix.lower()
-        run_syntax = TYPE_RUN_SYNTAX.get(ext)
-        if not run_syntax:
-            QMessageBox.warning(self, "Warning", f"Không hỗ trợ chạy file '{ext}'.")
+        # Use priority chain to find runner
+        runner_type, runner_cmd, runner_name = self.find_runner_for_file(file_path)
+        
+        if not runner_type:
+            ext = Path(file_path).suffix.lower()
+            QMessageBox.warning(self, "Warning", f"No runner available for '{ext}'.")
             return
-
-        # Tính tên output cho compiled languages
+        
+        ext = Path(file_path).suffix.lower()
+        
+        # For extension runners, replace {file} placeholder
+        if runner_type == "extension":
+            run_syntax = [runner_cmd.replace("{file}", file_path)]
+        else:
+            # Internal runner
+            run_syntax = runner_cmd
+        
+        # Calculate output name for compiled languages
         file_name_no_ext = Path(file_path).stem
         out_path = str(Path(file_path).parent / file_name_no_ext)
         if os.name == 'nt':
             out_path += '.exe'
 
-        # Build danh sách args từ TYPE_RUN_SYNTAX
+        # Build argument list from run_syntax
         args = [a.format(file=file_path, out=out_path) for a in run_syntax]
         program = args[0]
         program_args = args[1:]
+        
+        # Log runner info
+        if self.terminal_output:
+            self.terminal_output.append(f"Using: {runner_name}\n")
 
-        # Dừng process cũ nếu đang chạy
+        # Stop old process if running
         if self.process and self.process.state() != QProcess.NotRunning:
             self.process.kill()
             self.process.waitForFinished(1000)
@@ -1555,10 +2079,12 @@ class Main(QMainWindow):
         env.insert("PYTHONIOENCODING", "utf-8")
         env.insert("PYTHONUTF8", "1")
 
-        # Kiểm tra nếu là compiled language (có {out} trong syntax = cần compile rồi run)
+        # Check if compiled language (has {out} in syntax = needs compile then run)
         compiled_exts = ['.cpp', '.c', '.rs']
         if ext in compiled_exts:
-            self.terminal_output.append_output(f"Compiling: {program} {' '.join(program_args)}\n")
+            if self.terminal_output:
+                self.terminal_output.append(f"Compiling: {program} {' '.join(program_args)}\n")
+                self.terminal_container.show()
             compile_proc = QProcess(self)
             compile_proc.setProcessEnvironment(env)
             compile_proc.setProcessChannelMode(QProcess.MergedChannels)
@@ -1568,10 +2094,12 @@ class Main(QMainWindow):
 
             def on_compile_done(exit_code, exit_status):
                 if exit_code != 0:
-                    self.terminal_output.append_output("Compilation failed.\n")
+                    if self.terminal_output:
+                        self.terminal_output.append("Compilation failed.\n")
                     self.process = None
                     return
-                self.terminal_output.append_output(f"Running: {out_path}\n")
+                if self.terminal_output:
+                    self.terminal_output.append(f"Running: {out_path}\n")
                 run_proc = QProcess(self)
                 run_proc.setProcessEnvironment(env)
                 run_proc.setProcessChannelMode(QProcess.MergedChannels)
@@ -1585,7 +2113,9 @@ class Main(QMainWindow):
             compile_proc.start(program, program_args)
         else:
             # Interpreted language: run directly
-            self.terminal_output.append_output(f"Running: {program} {' '.join(program_args)}\n")
+            if self.terminal_output:
+                self.terminal_output.append(f"Running: {program} {' '.join(program_args)}\n")
+                self.terminal_container.show()
             self.process = QProcess(self)
             self.process.setProcessEnvironment(env)
             self.process.setProcessChannelMode(QProcess.MergedChannels)
@@ -1605,17 +2135,19 @@ class Main(QMainWindow):
                 text = data.decode("cp65001")
             except UnicodeDecodeError:
                 text = data.decode("latin-1")
-        if text:
-            self.terminal_output.append_output(text.replace('\r', ''))
+        if text and self.terminal_output:
+            self.terminal_output.append(text.replace('\r', ''))
 
     def on_process_finished(self, exit_code, exit_status):
-        self.terminal_output.append_output(f"\nProcess finished with exit code {exit_code}\n")
+        if self.terminal_output:
+            self.terminal_output.append(f"\nProcess finished with exit code {exit_code}\n")
         self.process = None
 
     def stop_process(self):
         if self.process and self.process.state() == QProcess.Running:
             self.process.kill()
-            self.terminal_output.append_output("\n[Stopped by user]\n")
+            if self.terminal_output:
+                self.terminal_output.append("\n[Stopped by user]\n")
             self.process = None
 
     def open_file(self):
@@ -1644,15 +2176,21 @@ class Main(QMainWindow):
                     curr_editor.setPlainText(content)
                     curr_editor.setProperty("file_path", abs_path)
                     self.tabFile.setTabText(curr_idx, file_name)
+                    self.adjust_tab_width(curr_idx)
+                    self.set_tab_icon(curr_idx, abs_path)
                     tab_index = curr_idx
                 else:
                     editor = self.create_editor(file_path, content)
                     
                     tab_index = self.tabFile.addTab(editor, file_name)
+                    self.adjust_tab_width(tab_index)
+                    self.set_tab_icon(tab_index, abs_path)
             else:
                 editor = self.create_editor(file_path, content)
                 
                 tab_index = self.tabFile.addTab(editor, file_name)
+                self.adjust_tab_width(tab_index)
+                self.set_tab_icon(tab_index, abs_path)
             
             self.tabFile.setCurrentIndex(tab_index)
             
@@ -1662,10 +2200,20 @@ class Main(QMainWindow):
             
             self.check_no_file()
         except Exception as e:
-            print(f"Open file error: {e}")
+            logger.error(f"Open file error: {e}")
 
+    def get_vncode_config_dir(self) -> Path:
+        """Get VNCode config directory in %APPDATA%/VNCode/."""
+        appdata = os.environ.get("APPDATA", "")
+        if not appdata:
+            appdata = str(Path.home() / "AppData" / "Roaming")
+        config_dir = Path(appdata) / "VNCode"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        return config_dir
+    
     def get_json_path(self):
-        return Path(__file__).resolve().parent / "config_VNCode.json"
+        """Get path to config_VNCode.json in %APPDATA%/VNCode/."""
+        return self.get_vncode_config_dir() / "config_VNCode.json"
     
     def check_no_file(self):
         if self.tabFile.count() == 0:
@@ -1688,10 +2236,11 @@ class Main(QMainWindow):
         try:
             editor = self.create_editor(content="")
             tab_index = self.tabFile.addTab(editor, "Untitled")
+            self.adjust_tab_width(tab_index)
             self.tabFile.setCurrentIndex(tab_index)
             self.check_no_file()
         except Exception as e:
-            print(e)
+            logger.error(f"Error creating new file: {e}")
     
     def save_file(self):
         idx = self.tabFile.currentIndex()
@@ -1718,6 +2267,8 @@ class Main(QMainWindow):
                     
                     editor.setProperty("file_path", abs_path)
                     self.tabFile.setTabText(idx, file_name)
+                    self.adjust_tab_width(idx)
+                    self.set_tab_icon(idx, abs_path)
                     
                     config = self._load_config()
                     config["file_used"][abs_path] = file_name
@@ -1726,7 +2277,7 @@ class Main(QMainWindow):
                     return
             self.clean_label()
         except Exception as e:
-            print(f"Save error: {e}")
+            logger.error(f"Save error: {e}")
     
     def save_as_file(self):
         idx = self.tabFile.currentIndex()
@@ -1745,12 +2296,14 @@ class Main(QMainWindow):
                 
                 editor.setProperty("file_path", abs_path)
                 self.tabFile.setTabText(idx, file_name)
+                self.adjust_tab_width(idx)
+                self.set_tab_icon(idx, abs_path)
                 
                 config = self._load_config()
                 config["file_used"][abs_path] = file_name
                 self._save_config(config)
         except Exception as e:
-            print(f"Save As error: {e}")
+            logger.error(f"Save As error: {e}")
 
     def _build_save_filter(self):
         parts = []
@@ -1815,7 +2368,7 @@ class Main(QMainWindow):
         if not run_info:
             QMessageBox.warning(self, "Lỗi", f"Không hỗ trợ chạy đa nhân cho ngôn ngữ '{lang or 'unknown'}'.")
             return
-        # Compiled languages cần compile trước
+        # Compiled languages need compilation first
         if "run" in run_info:
             QMessageBox.warning(self, "Lỗi", f"Không hỗ trợ chạy đa nhân cho ngôn ngữ biên dịch ({lang}).")
             return
@@ -1857,8 +2410,247 @@ class Main(QMainWindow):
             process.finished.connect(handle_finished)
             self.multi_processes.append(process)
             process.start()
+            
+    def apply_ide_theme(self, colors: dict):
+        """Apply colors from an extension theme to the whole IDE."""
+        if not colors:
+            return
+            
+        bg = colors.get("editor.background")
+        fg = colors.get("editor.foreground", "#d4d4d4")
+        sidebar_bg = colors.get("sideBar.background", bg)
+        status_bg = colors.get("statusBar.background", "#007acc")
+        
+        if bg:
+            self.theme_color = bg
+            # Update base stylesheet
+            style = self.styleSheet()
+            # This is a bit simplified, but updates the main bg
+            self.setStyleSheet(f"""
+                QMainWindow, QWidget {{ background-color: {bg}; color: {fg}; }}
+                QTextEdit {{ background-color: {bg}; color: {fg}; }}
+                QMenuBar {{ background-color: {sidebar_bg}; color: {fg}; }}
+                QStatusBar {{ background-color: {status_bg}; color: {fg}; }}
+                QTabBar::tab {{ background-color: {sidebar_bg}; }}
+                QTabBar::tab:selected {{ background-color: {bg}; border-bottom: 2px solid {status_bg}; }}
+            """)
+            
+            # Save to config
+            config = self._load_config()
+            config["theme_color"] = bg
+            self._save_config(config)
 
-    
+    def register_extension_snippets(self, lang: str, completions: list):
+        """Register snippets from an extension for use in the editor."""
+        self.extension_snippets[lang].extend(completions)
+        logger.info(f"Registered {len(completions)} snippets for {lang}")
+
+    def show_marketplace(self):
+        """Show the marketplace sidebar."""
+        self.sidebar.show()
+        self.toggle_ext_panel_action.setChecked(True)
+
+    def toggle_extension_panel(self):
+        """Toggle the marketplace sidebar visibility."""
+        if self.sidebar.isVisible():
+            self.sidebar.hide()
+            self.toggle_ext_panel_action.setChecked(False)
+        else:
+            self.show_marketplace()
+
+    def show_find_widget(self):
+        """Show the find widget and focus on the input field."""
+        self.find_widget.show()
+        self.find_input.setFocus()
+        self.find_input.selectAll()
+
+    def hide_find_widget(self):
+        """Hide the find widget and clear highlights."""
+        self.find_widget.hide()
+        self.clear_find_highlights()
+
+    def on_find_text_changed(self, text):
+        """Called when find text changes - update highlights."""
+        self.find_matches.clear()
+        self.current_find_index = 0
+        self.find_counter.setText("0/0")
+        
+        if not text or not self.current_file:
+            self.clear_find_highlights()
+            return
+        
+        # Get the current editor
+        current_editor = self.tabFile.currentWidget()
+        if not current_editor:
+            return
+        
+        # Find all matches
+        doc = current_editor.document()
+        cursor = QTextCursor(doc)
+        
+        while not cursor.isAtEnd():
+            cursor = doc.find(text, cursor)
+            if cursor.isNull():
+                break
+            self.find_matches.append(cursor.block().blockNumber())
+        
+        # Update counter and highlight first match
+        if self.find_matches:
+            self.find_counter.setText(f"1/{len(self.find_matches)}")
+            self.highlight_find_match(0)
+        else:
+            self.find_counter.setText("0/0")
+            self.clear_find_highlights()
+
+    def find_next(self):
+        """Find next occurrence."""
+        if not self.find_matches or not self.find_input.text():
+            return
+        
+        self.current_find_index = (self.current_find_index + 1) % len(self.find_matches)
+        self.find_counter.setText(f"{self.current_find_index + 1}/{len(self.find_matches)}")
+        self.highlight_find_match(self.current_find_index)
+
+    def find_previous(self):
+        """Find previous occurrence."""
+        if not self.find_matches or not self.find_input.text():
+            return
+        
+        self.current_find_index = (self.current_find_index - 1) % len(self.find_matches)
+        self.find_counter.setText(f"{self.current_find_index + 1}/{len(self.find_matches)}")
+        self.highlight_find_match(self.current_find_index)
+
+    def highlight_find_match(self, index):
+        """Highlight the match at the specified index."""
+        if not self.current_file or index >= len(self.find_matches):
+            return
+        
+        current_editor = self.tabFile.currentWidget()
+        if not current_editor:
+            return
+        
+        doc = current_editor.document()
+        block = doc.findBlockByNumber(self.find_matches[index])
+        text_to_find = self.find_input.text()
+        
+        # Clear previous highlights
+        self.clear_find_highlights()
+        
+        # Highlight all matches with yellow
+        cursor = QTextCursor(doc)
+        while not cursor.isAtEnd():
+            cursor = doc.find(text_to_find, cursor)
+            if cursor.isNull():
+                break
+            cursor.mergeCharFormat(self.find_format)
+        
+        # Move cursor to current match
+        cursor = QTextCursor(doc)
+        cursor.movePosition(QTextCursor.Start)
+        for _ in range(block.blockNumber()):
+            cursor.movePosition(QTextCursor.NextBlock)
+        
+        # Find the text in this block
+        pos = block.text().find(text_to_find)
+        if pos >= 0:
+            cursor.movePosition(QTextCursor.StartOfBlock)
+            cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, pos)
+            cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, len(text_to_find))
+            current_editor.setTextCursor(cursor)
+            current_editor.ensureCursorVisible()
+
+    def clear_find_highlights(self):
+        """Clear all find highlights from the current editor."""
+        if not self.current_file:
+            return
+        
+        current_editor = self.tabFile.currentWidget()
+        if not current_editor:
+            return
+        
+        # Clear all formatting
+        doc = current_editor.document()
+        cursor = QTextCursor(doc)
+        cursor.select(QTextCursor.Document)
+        default_format = QTextCharFormat()
+        cursor.setCharFormat(default_format)
+
+    def get_installed_extensions_info(self) -> list:
+        """
+        Get info about all installed extensions (for auto-load/integration).
+        
+        Returns:
+            List of dicts with: displayName, description, version, has_theme, has_snippets
+        """
+        from extension_manager import auto_load_extensions
+        installed = auto_load_extensions()
+        
+        result = []
+        for ext in installed:
+            contributions = ext.get("contributions", {})
+            info = {
+                "displayName": ext.get("displayName", ext.get("name", "Unknown")),
+                "description": ext.get("description", ""),
+                "version": ext.get("version", "Unknown"),
+                "has_theme": len(contributions.get("themes", [])) > 0,
+                "has_snippets": len(contributions.get("snippets", [])) > 0,
+                "has_language": len(contributions.get("languages", [])) > 0,
+                "namespace": ext.get("namespace", ""),
+                "name": ext.get("name", ""),
+            }
+            result.append(info)
+        
+        return result
+
+    def get_extension_commands(self) -> dict:
+        """
+        Get all available commands from installed extensions.
+        
+        Returns:
+            Dict mapping command IDs to command info dicts.
+        """
+        ext_commands = {}
+        from extension_manager import list_installed
+        
+        for ext in list_installed():
+            contributions = ext.get("contributions", {})
+            for cmd in contributions.get("commands", []):
+                cmd_id = cmd.get("command", "")
+                if cmd_id:
+                    ext_commands[cmd_id] = {
+                        "title": cmd.get("title", cmd_id),
+                        "category": cmd.get("category", "Extension"),
+                        "description": cmd.get("description", ""),
+                        "extension": ext.get("displayName", ext.get("name", "Unknown")),
+                    }
+        
+        return ext_commands
+
+    def get_extension_runners(self) -> dict:
+        """
+        Get code runners from extensions.
+        Returns dict with language -> runner command mapping.
+        """
+        runners = {}
+        from extension_manager import list_installed
+        
+        for ext in list_installed():
+            contributions = ext.get("contributions", {})
+            for cmd in contributions.get("commands", []):
+                cmd_id = cmd.get("command", "").lower()
+                if "run" in cmd_id or "execute" in cmd_id or "code" in cmd_id:
+                    title = cmd.get("title", "").lower()
+                    if any(x in title for x in ["run", "execute", "test"]):
+                        ext_name = ext.get("displayName", ext.get("name", "Unknown"))
+                        if ext_name not in runners:
+                            runners[ext_name] = []
+                        runners[ext_name].append({
+                            "command": cmd_id,
+                            "title": cmd.get("title", "Run"),
+                            "description": cmd.get("description", ""),
+                        })
+        
+        return runners
     
     def auto_check_current_file_used(self):
         config = self._load_config()
@@ -1883,7 +2675,7 @@ class Main(QMainWindow):
             return []
 
         prefix_lower = prefix.lower()
-        max_files = 80  # tránh quét quá nhiều file gây lag
+        max_files = 80  # Avoid scanning too many files to prevent lag
         collected: list[str] = []
         visited = 0
 
@@ -1906,21 +2698,21 @@ class Main(QMainWindow):
                 except Exception:
                     continue
 
-                # Python: sử dụng get_buffer_symbols đã có AST
+                # Python: use get_buffer_symbols with AST
                 if ext == ".py":
                     try:
                         buf_syms = self.get_buffer_symbols(text, lang="python", prefix=prefix)
-                        # Lấy display_label (s[1]) để hiển thị trong list project symbols
+                        # Use display_label (s[1]) for display in project symbols list
                         collected.extend([s[1] for s in buf_syms if s[0].lower().startswith(prefix_lower)])
                     except Exception:
                         pass
                 elif ext in [".c", ".cpp", ".cc", ".h", ".hpp"]:
                     try:
-                        cpp_syms = self.get_buffer_symbols_cpp(text, len(text), prefix)
+                        cpp_syms = self.get_buffer_symbols_cpp(text, len(text), prefix, lang_key)
                         collected.extend([s[0] for s in cpp_syms if s[0].lower().startswith(prefix_lower)])
                     except Exception:
                         pass
-                # Ngôn ngữ khác: dùng buffer_symbols chung
+                # Other languages: use common buffer_symbols
                 else:
                     try:
                         buf_syms = self.get_buffer_symbols(text, lang=lang_key, prefix=prefix)
@@ -1930,7 +2722,7 @@ class Main(QMainWindow):
         except Exception:
             return []
 
-        # dedupe, giữ thứ tự
+        # Deduplicate while preserving order
         seen = set()
         out: list[str] = []
         for s in collected:
@@ -1939,7 +2731,71 @@ class Main(QMainWindow):
                 seen.add(key)
                 out.append(s)
         return out
+    
+    def _load_extensions(self):
+        """Load installed extensions and apply runtime hooks."""
+        try:
+            from extension_manager import auto_load_extensions, apply_extension_hooks, get_extension_hooks
+            
+            # Load all installed extensions
+            extensions = auto_load_extensions()
+            if not extensions:
+                logger.info("No extensions installed")
+                return
+            
+            logger.info(f"Loading {len(extensions)} extensions...")
+            
+            # Apply runtime hooks for code runners, LSP, highlighters, etc.
+            apply_extension_hooks(extensions)
+            self.extension_hooks = get_extension_hooks()
+            
+            # Add Run buttons for code runner extensions
+            self._setup_code_runner_buttons()
+            
+            logger.info(f"Extensions loaded and hooks applied")
         
+        except Exception as e:
+            logger.error(f"Failed to load extensions: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _setup_code_runner_buttons(self):
+        """Add toolbar buttons for code runner extensions."""
+        try:
+            if not self.extension_hooks:
+                return
+            
+            code_runners = self.extension_hooks.get_code_runner_extensions()
+            if not code_runners:
+                return
+            
+            # Create or get toolbar
+            if not hasattr(self, 'toolbar'):
+                self.toolbar = QToolBar("Extensions Toolbar")
+                self.toolbar.setIconSize(QSize(16, 16))
+                self.toolbar.setMovable(False)
+                self.addToolBar(self.toolbar)
+            
+            # Add separator
+            self.toolbar.addSeparator()
+            
+            # Add buttons for each code runner
+            for runner_ext in code_runners:
+                display_name = runner_ext.get("displayName", "Run")
+                
+                # Create action
+                run_button = QAction(f"▶ {display_name}", self)
+                run_button.setToolTip(f"{display_name} - {runner_ext.get('description', '')}")
+                run_button.triggered.connect(self.run_current_file)
+                
+                self.toolbar.addAction(run_button)
+            
+            logger.info(f"Added {len(code_runners)} code runner toolbar buttons")
+        
+        except Exception as e:
+            logger.error(f"Failed to setup code runner buttons: {e}")
+        
+
 def run():
     app = QApplication(sys.argv)
     screen = Main()
@@ -1949,5 +2805,5 @@ def run():
 if __name__ == '__main__':
     run()
 
-#2025 VNCORE LAB(alias of Nguyễn Trường Lâm)
-#command build: pyinstaller --onedir --noconfirm --icon="icon_VNCode.ico" --add-data "fill_module.py;." --add-data "list_module.py;." --add-data "icon_VNCode.ico;." --add-data "close_hover.svg;." --add-data "close.svg;." run.py
+#2025 VNCORE LAB (VNCode authored by Nguyen Truong Lam)
+#command build: pyinstaller --onedir --noconfirm --icon="icon_VNCode.ico" --add-data "fill_module.py;." --add-data "list_module.py;." --add-data "icon_VNCode.ico;." --add-data "close_hover.svg;." --add-data "close.svg;." --add-data "auto_load_fragment.py;." --add-data "extension_manager.py;." --add-data "extension_integration.py;." --add-data "extension_types.py;." --add-data "lsp_python.py;." --add-data "marketplace_widget.py;." --add-data "openvsx_api.py;." --add-data "icon/icon_L;icon/icon_L" run.py
