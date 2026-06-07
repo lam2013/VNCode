@@ -9,8 +9,8 @@ from PyQt5.QtGui import *
 import os
 import logging
 
-import openvsx_api
-import extension_manager
+import api as openvsx_api
+import core as extension_manager
 
 try:
     from run import logger
@@ -190,7 +190,7 @@ class ExtensionCard(QFrame):
         ext_type = ext_info.get("type")
         if ext_type:
             try:
-                from extension_types import (
+                from core import (
                     ExtensionType, get_type_display_name, 
                     get_type_color, get_type_description
                 )

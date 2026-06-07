@@ -37,14 +37,35 @@ tính năng:
 		+swift
 		+kotlin
 		+powershell
+	- thêm extension marketplace
+	- hỗ trợ đa số extension
+	- thêm LSP:
+	    + v1.1:
+			+ python
+		+ v1.2:
+			+ c/c++
+		+ v1.3:
+			+ c#
+	- mini update:
+		+ thêm icon languese
+	v1.2:
+	- update highlight tốt hơn:
+		+ highlight syntax theo kiểu python:
+			- hỗ trợ highlight cho format string ("{}") theo syntax kiểu python
+			- highlight cho gọi functon(nếu đằng sau có "()" và trước đó có "." thì sẽ highlight màu tím function đó)
+			- highlight (xám cho varible; xám tím cho function; xám cam class, struct,...) cho những varible, function,class,... chưa được gọi lần thứ hai
+		+ highlight syntax theo kiểu c/c++:
+			- highlight function (nếu sau đó có " <<" hay "<<" theo kiểu c++ hoặc kiểu gọi function của c thì tô màu tím cho function đó)
+			- highlight varible, function,class,... (xám cho varible; xám tím cho function; xám cam class, struct,...)
+	- thêm undo
+	- thêm hỗ trợ LSP cho c/c++
+	- hỗ trợ lsp tốt hơn(tìm syntax sau dấu chấm (theo syntax kiểu python) hay sau :: hoặc . (theo syntax kiểu c/c++))
+	update v1.3:
+	    major update:
+		    - tự động cập nhật trạng thái file (tồn tại, đã bị xóa/đổi vị trí)
+		    - cho phép lưu file khi file đó bị xóa hoặc bị đổi vị trí
+		    - lorem
 
-tính năng mới:
--thêm extension marketplace
--hỗ trợ đa số extension
--thêm LSP:
-+python
-mini update:
--thêm icon languese
 
 cách chạy:
 1. chạy thủ công(nếu bạn biết sơ về command):
@@ -55,7 +76,8 @@ cách chạy:
         +chạy lệnh như sau:
             python -u "{parent folder}\run.py"
 2.tự động:
-    chạy thẳng file exe
+	- chạy file auto_build.bat để build exe
+	- file exe được tạo ra nằm trong folder "dist"
     
 thank for python
 link tải python: https://www.python.org/downloads/
