@@ -10,9 +10,11 @@ from pathlib import *
 from list_module import *
 from fill_module import *
 import re
-from collections import defaultdict
+import ast
+import hashlib
+from collections import defaultdict, Counter
 from marketplace_widget import MarketplaceWidget
-import extension_manager
+from core import *
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
@@ -70,6 +72,7 @@ def resource_path(relative_path):
 class RenameDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
+        print("2025 VNCORE LAB (VNCode authored by Nguyễn Trường Lâm)")
         self.setWindowTitle("Rename File")
         self.setFixedSize(400, 150)
         
@@ -227,7 +230,7 @@ class Main(QMainWindow):
             
             # TRY LSP EXTENSION FIRST
             try:
-                from extension_integration import get_lsp_aware_suggestions
+                from api import get_lsp_aware_suggestions
                 if hasattr(self, 'extension_hooks') and self.extension_hooks:
                     lsp_suggestions = get_lsp_aware_suggestions(lang, prefix, self.extension_hooks, text, line_num, char_in_line)
                     if lsp_suggestions:
@@ -433,7 +436,7 @@ class Main(QMainWindow):
         
         # TRY LSP EXTENSION FIRST
         try:
-            from extension_integration import get_lsp_aware_suggestions
+            from api import get_lsp_aware_suggestions
             if hasattr(self, 'extension_hooks') and self.extension_hooks:
                 lsp_suggestions = get_lsp_aware_suggestions(lang, prefix, self.extension_hooks, text, line_num, char_in_line)
                 if lsp_suggestions:
@@ -1073,9 +1076,10 @@ class Main(QMainWindow):
                     bottom = top + int(self.editor.blockBoundingRect(block).height())
                     block_number += 1
         class CodeHighlighter(QSyntaxHighlighter):
-            def __init__(self, parent=None, lang=""):
+            def __init__(self, parent=None, lang="", main=None):
                 super().__init__(parent)
                 self.lang = lang
+                self.main = main  # Reference to Main instance for LSP queries
                 self.highlighting_rules = []
 
                 # Format for different types
@@ -1084,10 +1088,10 @@ class Main(QMainWindow):
                 self.keyword_format.setFontWeight(QFont.Bold)
 
                 self.function_format = QTextCharFormat()
-                self.function_format.setForeground(QColor("#dcdcaa")) # Light yellow for functions
+                self.function_format.setForeground(QColor("#c586c0")) # Purple for functions
 
                 self.class_format = QTextCharFormat()
-                self.class_format.setForeground(QColor("#4ec9b0")) # Cyan for classes
+                self.class_format.setForeground(QColor("#ffb86c")) # Orange for classes
 
                 self.number_format = QTextCharFormat()
                 self.number_format.setForeground(QColor("#b5cea8")) # Green for numbers
@@ -1104,55 +1108,120 @@ class Main(QMainWindow):
                 self.identifier_format = QTextCharFormat()
                 self.identifier_format.setForeground(QColor("#ffffff"))  # White for identifiers
 
+                # Variable Format (for Python - white)
+                self.variable_format = QTextCharFormat()
+                self.variable_format.setForeground(QColor("#ffffff"))  # White for variables
+
                 self.escape_format = QTextCharFormat()
                 self.escape_format.setForeground(QColor("#d7ba7d"))  # Dark yellow for escape sequences
 
-                # ========================================================
-                # Rule order is VERY IMPORTANT:
-                # In QSyntaxHighlighter, later added rules will override earlier ones
-                # Later rules will override earlier ones if they overlap.
-                # ========================================================
+                # String Prefix Format (f, r, b, u)
+                self.string_prefix_format = QTextCharFormat()
+                self.string_prefix_format.setForeground(QColor("#6a9955"))  # Dark green for string prefixes
 
-                # 1. General identifiers and numbers (lowest priority)
-                self.highlighting_rules.append((re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b'), self.identifier_format))
-                self.highlighting_rules.append((re.compile(r'\b\d+(\.\d+)?\b'), self.number_format))
-                # import
+                # F-String Specific Formats (from test.py)
+                self.fstring_format = QTextCharFormat()
+                self.fstring_format.setForeground(QColor("#2aa198"))  # Teal/Xanh lá for f-string
+
+                self.fstring_brace_format = QTextCharFormat()
+                self.fstring_brace_format.setForeground(QColor("#ce9178"))  # Red-orange for braces
+                self.fstring_brace_format.setFontWeight(QFont.Bold)
+
+                # Argument Highlight Format (Red-Orange)
+                self.argument_format = QTextCharFormat()
+                self.argument_format.setForeground(QColor("#ce9178"))  # Red-orange for arguments
                 
-                # 2. Classes (usually capitalized)
-                self.highlighting_rules.append((re.compile(r'\b[A-Z][a-zA-Z0-9_]*\b'), self.class_format))
+                # Module Format
+                self.module_format = QTextCharFormat()
+                self.module_format.setForeground(QColor("#b5cea8"))  # Green for modules and #include
 
-                # 3. Functions (word followed by opening parenthesis)
-                self.highlighting_rules.append((re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*(?=\s*\()'), self.function_format))
+                # Unused Symbols Format (from test.py)
+                self.unused_var_format = QTextCharFormat()
+                self.unused_var_format.setForeground(QColor("#757575"))  # Gray-white for unused variables
+                self.unused_var_format.setFontItalic(True)  # Italic để dễ phân biệt
 
-                # 4. Keywords (will override identifiers above to prevent confusion)
+                self.unused_func_format = QTextCharFormat()
+                self.unused_func_format.setForeground(QColor("#8a7fa4"))  # Gray-purple for unused functions
+                self.unused_func_format.setFontWeight(QFont.Bold)
+
+                self.unused_class_format = QTextCharFormat()
+                self.unused_class_format.setForeground(QColor("#b59a7a"))  # Gray-orange for unused classes
+                self.unused_class_format.setFontWeight(QFont.Bold)
+
+                # ========================================================
+                
+                # 0. C/C++ Macros (Highest priority: overrides keywords and identifiers)
+                if self.lang in ['cpp', 'c']:
+                    self.highlighting_rules.append((re.compile(r'^\s*(#\s*[a-zA-Z0-9_]+)'), self.module_format, 1))
+                    self.highlighting_rules.append((re.compile(r'#\s*include\s*(<[^>]+>)'), self.string_format, 1))
+
+                # 1. Numbers (first)
+                self.highlighting_rules.append((re.compile(r'\b\d+(\.\d+)?\b'), self.number_format))
+                
+                # 2. Keywords (will override identifiers)
                 keywords = [
                     'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'return', 'class', 'struct',
                     'int', 'float', 'double', 'char', 'void', 'bool', 'const', 'static', 'public', 'private',
-                    'def', 'import', 'from', 'as', 'True', 'False', 'None', 'print', 'in', 'elif'
+                    'def', 'import', 'from', 'as', 'True', 'False', 'None', 'print', 'in', 'elif', 'try', 'except', 
+                    'finally', 'with', 'yield', 'async', 'await', 'lambda', 'pass', 'break', 'continue'
                 ]
                 for word in keywords:
                     pattern = r'\b' + word + r'\b'
                     self.highlighting_rules.append((re.compile(pattern), self.keyword_format))
 
-                # 5. Braces
+                # 3. Braces
                 self.highlighting_rules.append((re.compile(r'[\{\}\[\]\(\)]'), self.brace_format))
 
-                # 6. String Prefix (f, r, b, u)
-                self.highlighting_rules.append((re.compile(r'\b[fFrRbBuU]+(?=["\'])'), self.keyword_format))
+                # 4. String Prefix (f, r, b, u)
+                self.highlighting_rules.append((re.compile(r'\b[fFrRbBuU]+(?=["\'])'), self.string_prefix_format))
 
-                # 6.1 String
+                # 5. Strings
                 self.highlighting_rules.append((re.compile(r'"[^"\\]*(\\.[^"\\]*)*"'), self.string_format))
                 self.highlighting_rules.append((re.compile(r"'[^'\\]*(\\.[^'\\]*)*'"), self.string_format))
-                self.highlighting_rules.append((re.compile(r'#include\s*(<[^>]+>)'), self.string_format, 1))
-                self.highlighting_rules.append((re.compile(r'#include'), self.keyword_format))
 
-                # 6.2 F-String Post-Processing
-                self.highlighting_rules.append((re.compile(r'f"[^"\\]*(\\.[^"\\]*)*"', re.IGNORECASE), "f-string"))
-                self.highlighting_rules.append((re.compile(r"f'[^'\\]*(\\.[^'\\]*)*'", re.IGNORECASE), "f-string"))
+                # 6. F-String (only Python)
+                if self.lang in ['python', 'nim']:
+                    self.fstring_pattern = re.compile(
+                        r'([fF]"[^"\n]*)?(\{[^"\n]*?\})?([^"\n]*?")'
+                    )
+                    self.highlighting_rules.append((self.fstring_pattern, "fstring-enhanced"))
+                    
+                    self.highlighting_rules.append((re.compile(r'f"[^"\\]*(\\.[^"\\]*)*"', re.IGNORECASE), self.fstring_format))
+                    self.highlighting_rules.append((re.compile(r"f'[^'\\]*(\\.[^'\\]*)*'", re.IGNORECASE), self.fstring_format))
 
-                # 6.3 Escape sequences
+                # 7. Escape sequences
                 self.highlighting_rules.append((re.compile(r'\\[\\\'"nrtvfa0-7xUu]'), self.escape_format))
 
+                # 8. PEP8-based identifier highlighting (ONLY FOR PYTHON)
+                if self.lang == 'python':
+                    # Modules in import/from
+                    self.highlighting_rules.append((re.compile(r'\b(?:import|from)\s+([a-zA-Z0-9_\.]+)'), self.module_format, 1))
+
+                    # Functions (followed by '(')
+                    self.highlighting_rules.append((re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*(?=\s*\()'), self.function_format))
+                    
+                    # Classes (CapWords - starts with uppercase)
+                    self.highlighting_rules.append((re.compile(r'\b[A-Z][a-zA-Z0-9_]*\b'), self.class_format))
+                    
+                    # Variables (starts with lowercase or _)
+                    self.highlighting_rules.append((re.compile(r'\b[a-z_][a-zA-Z0-9_]*\b'), self.variable_format))
+                else:
+                    # For other languages, use simpler rules
+                    # Functions (followed by '(')
+                    self.highlighting_rules.append((re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*(?=\s*\()'), self.function_format))
+                    
+                    # Classes (CapWords)
+                    self.highlighting_rules.append((re.compile(r'\b[A-Z][a-zA-Z0-9_]*\b'), self.class_format))
+
+                # 9. Arguments (only Python)
+                if self.lang in ['python', 'nim']:
+                    self.argument_pattern = re.compile(r'\([^()]*\)')
+                    self.highlighting_rules.append((self.argument_pattern, "argument"))
+
+                # 10. Generic identifiers (fallback for all languages)
+                self.highlighting_rules.append((re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b'), self.identifier_format))
+
+                # 11. Comments
                 self.highlighting_rules.append((re.compile(r'//.*'), self.comment_format))
                 self.highlighting_rules.append((re.compile(r'/\*.*?\*/', re.DOTALL), self.comment_format))
                 if self.lang in ['python', 'nim', 'yaml', 'sh', 'bash', 'rb']:
@@ -1161,11 +1230,105 @@ class Main(QMainWindow):
                 # TRY TO APPLY EXTENSION HIGHLIGHTER
                 # Access main window's extension hooks
                 try:
-                    from extension_integration import get_syntax_highlighter_for_language, load_textmate_grammar, apply_textmate_grammar_to_highlighter
+                    from api import get_syntax_highlighter_for_language, load_textmate_grammar, apply_textmate_grammar_to_highlighter
                     # This will be set by main window later
                     self.extension_hooks_ref = None
                 except Exception as e:
                     logger.debug(f"Extension highlighter not available: {e}")
+                
+                # Caching + Debounce for unused symbols analysis
+                self.unused_symbols_cache = []  # Cache results từ lần phân tích cuối
+                self.last_document_hash = None  # Hash của document lần cuối để detect thay đổi
+                
+                # LSP semantic cache - stores symbol classification (func/class/var)
+                self.lsp_symbols_cache = {}  # LSP classification from get_buffer_symbols
+                
+                self.debounce_timer = QTimer()  # Timer cho debouncing
+                self.debounce_timer.setSingleShot(True)  # Chỉ fire một lần
+                self.debounce_timer.timeout.connect(self.on_document_changed)
+                self.debounce_delay = 500  # milliseconds - chỉ phân tích sau khi ngừng gõ 0.5s
+                
+                if self.document():
+                    self.document().contentsChange.connect(lambda: self.debounce_timer.start(self.debounce_delay))
+                QTimer.singleShot(100, self.on_document_changed)
+            
+            def analyze_unused_symbols(self, text):
+                """
+                Hàm phân tích AST chuẩn hóa tọa độ, triệt tiêu lỗi lệch dòng Windows (\r\n)
+                """
+                highlights = []
+                if not text or not text.strip():
+                    return highlights
+        
+                # CHUẨN HÓA QUAN TRỌNG: Ép toàn bộ dấu xuống dòng về \n để khớp hoàn toàn với PyQt
+                text = text.replace('\r\n', '\n').replace('\r', '\n')
+    
+                try:
+                    tree = ast.parse(text)
+                except Exception:
+                    # Nếu đang gõ dở bị lỗi cú pháp, trả về rỗng để giữ nguyên màu cũ, tránh crash IDE
+                    return highlights
+
+                # Đếm số lần xuất hiện toàn cục của các từ định danh
+                all_names = []
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Name):
+                        all_names.append(node.id)
+                    elif isinstance(node, ast.Attribute):
+                        all_names.append(node.attr)
+
+                name_counts = Counter(all_names)
+
+                # Duyệt cây AST để lấy vị trí chính xác (Dòng và Cột gốc)
+                for node in ast.walk(tree):
+                    # 1. Kiểm tra Hàm / Method chưa dùng
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if name_counts[node.name] <= 1:
+                            length = len(node.name)
+                            # Tính từ vị trí node bắt đầu, bỏ qua chữ 'def ' (4 ký tự) để trỏ thẳng vào tên hàm
+                            start_col = node.col_offset + 4
+                            highlights.append((node.lineno, start_col, length, self.unused_func_format))
+
+                    # 2. Kiểm tra Class / Struct chưa dùng
+                    elif isinstance(node, ast.ClassDef):
+                        if name_counts[node.name] <= 1:
+                            length = len(node.name)
+                            # Bỏ qua chữ 'class ' (6 ký tự) để trỏ thẳng vào tên class
+                            start_col = node.col_offset + 6
+                            highlights.append((node.lineno, start_col, length, self.unused_class_format))
+
+                    # 3. Kiểm tra Biến số gán thông thường (=)
+                    elif isinstance(node, ast.Assign):
+                        for target in node.targets:
+                            if isinstance(target, ast.Name) and name_counts[target.id] <= 1:
+                                highlights.append((target.lineno, target.col_offset, len(target.id), self.unused_var_format))
+                            elif isinstance(target, ast.Attribute) and name_counts[target.attr] <= 1:
+                                highlights.append((target.lineno, target.col_offset, len(target.attr), self.unused_var_format))
+
+                    # 4. Kiểm tra Biến số dạng Type Hint (ví dụ: x: int = 5)
+                    elif isinstance(node, ast.AnnAssign):
+                        if isinstance(node.target, ast.Name) and name_counts[node.target.id] <= 1:
+                            target = node.target
+                            highlights.append((target.lineno, target.col_offset, len(target.id), self.unused_var_format))
+
+                return highlights
+            
+            def on_document_changed(self):
+                """Called by debounce timer - analyze unused symbols with caching."""
+                if self.lang != 'python':
+                    return
+                
+                doc_text = self.document().toPlainText()
+                
+                # Calculate hash of current document
+                doc_hash = hashlib.md5(doc_text.encode()).hexdigest()
+                
+                # Only analyze if document content changed
+                if doc_hash != self.last_document_hash:
+                    self.last_document_hash = doc_hash
+                    self.unused_symbols_cache = self.analyze_unused_symbols(doc_text)
+                    # Trigger full document rehighlight
+                    self.rehighlight()
 
             def apply_extension_highlighter(self, extension_hooks):
                 """Apply syntax highlighting rules from extension grammar if available."""
@@ -1173,7 +1336,7 @@ class Main(QMainWindow):
                     return
                 
                 try:
-                    from extension_integration import get_syntax_highlighter_for_language, load_textmate_grammar, apply_textmate_grammar_to_highlighter
+                    from api import get_syntax_highlighter_for_language, load_textmate_grammar, apply_textmate_grammar_to_highlighter
                     
                     highlighter_ext = get_syntax_highlighter_for_language(self.lang, extension_hooks)
                     if highlighter_ext:
@@ -1194,45 +1357,125 @@ class Main(QMainWindow):
                     logger.debug(f"Failed to apply extension highlighter: {e}")
 
             def highlightBlock(self, text):
-                for rule in self.highlighting_rules:
+                # 1. Apply generic syntax highlighting rules
+                for rule in reversed(self.highlighting_rules):
                     pattern = rule[0]
-                    text_format = rule[1]
-                    group_idx = rule[2] if len(rule) > 2 else 0
-                    
-                    if text_format == "f-string":
-                        for match in pattern.finditer(text):
-                            s_start = match.start()
-                            s_end = match.end()
-                            inside_str = text[s_start:s_end]
-                            for m2 in re.finditer(r'(?<!\{)\{([^{}]+)\}(?!\})', inside_str):
-                                brace_start = s_start + m2.start()
-                                brace_end = s_start + m2.end()
-                                inner_text = m2.group(1)
-                                inner_start = s_start + m2.start(1)
-                                
-                                self.setFormat(brace_start, 1, self.brace_format)
-                                self.setFormat(brace_end - 1, 1, self.brace_format)
-                                
-                                for inner_rule in self.highlighting_rules:
-                                    i_pattern = inner_rule[0]
-                                    i_format = inner_rule[1]
-                                    i_group = inner_rule[2] if len(inner_rule) > 2 else 0
-                                    
-                                    if i_format in [self.string_format, self.comment_format, "f-string"]:
-                                        continue
-                                        
-                                    for m3 in i_pattern.finditer(inner_text):
-                                        if i_group > 0 and m3.group(i_group) is not None:
-                                            self.setFormat(inner_start + m3.start(i_group), m3.end(i_group) - m3.start(i_group), i_format)
-                                        else:
-                                            self.setFormat(inner_start + m3.start(), m3.end() - m3.start(), i_format)
-                    else:
-                        for match in pattern.finditer(text):
-                            if group_idx > 0:
-                                if match.group(group_idx) is not None:
-                                    self.setFormat(match.start(group_idx), match.end(group_idx) - match.start(group_idx), text_format)
+                    fmt = rule[1]
+                    group = rule[2] if len(rule) > 2 else 0
+
+                    if isinstance(fmt, str):
+                        if fmt == "argument":
+                            for match in pattern.finditer(text):
+                                for word_match in re.finditer(r'\b[a-zA-Z_]\w*\b', match.group()):
+                                    self.setFormat(match.start() + word_match.start(), word_match.end() - word_match.start(), self.argument_format)
+                        elif fmt == "fstring-enhanced":
+                            for match in pattern.finditer(text):
+                                if match.group(1):
+                                    self.setFormat(match.start(1), match.end(1) - match.start(1), self.fstring_format)
+                                if match.group(2):
+                                    self.setFormat(match.start(2), match.end(2) - match.start(2), self.fstring_brace_format)
+                                if match.group(3):
+                                    self.setFormat(match.start(3), match.end(3) - match.start(3), self.fstring_format)
+                        continue
+
+                    for match in pattern.finditer(text):
+                        self.setFormat(match.start(group), match.end(group) - match.start(group), fmt)
+
+                # 3. Apply custom overrides for CapWords variables and dotted access
+                line_strip = text.strip()
+                is_import_or_include = (
+                    line_strip.startswith('import ') or 
+                    line_strip.startswith('from ') or 
+                    line_strip.startswith('namespace') or 
+                    line_strip.startswith('using ') or
+                    line_strip.startswith('#include') or
+                    line_strip.startswith('#define')
+                )
+
+                if not is_import_or_include:
+                    # PASS A: Dotted access overrides (e.g., obj.MyClass.member)
+                    dotted_pattern = re.compile(r'\b([a-zA-Z_]\w*(?:\s*\.\s*[a-zA-Z_]\w*)+)\b')
+                    for match in dotted_pattern.finditer(text):
+                        dotted_path = match.group(1)
+                        path_start = match.start(1)
+                        path_end = match.end(1)
+                        
+                        # Find the last identifier in the dotted path
+                        last_matches = list(re.finditer(r'\b[a-zA-Z_]\w*\b', dotted_path))
+                        if last_matches:
+                            last_match = last_matches[-1]
+                            last_word = last_match.group()
+                            last_start = path_start + last_match.start()
+                            last_len = len(last_word)
+                            
+                            after_text = text[path_end:].lstrip()
+                            is_func = after_text.startswith('(')
+                            is_var = after_text.startswith('=')
+                            
+                            if is_func:
+                                # Only format the last identifier as a function
+                                self.setFormat(last_start, last_len, self.function_format)
+                                # Clear formatting for preceding elements in the path
+                                self.setFormat(path_start, last_start - path_start, self.variable_format)
+                            elif is_var:
+                                # Only format the last identifier as a variable
+                                self.setFormat(last_start, last_len, self.variable_format)
+                                # Clear formatting for preceding elements
+                                self.setFormat(path_start, last_start - path_start, self.variable_format)
                             else:
-                                self.setFormat(match.start(), match.end() - match.start(), text_format)
+                                # Clear formatting for the entire dotted path
+                                self.setFormat(path_start, path_end - path_start, self.variable_format)
+
+                    # PASS B: CapWords Variable Overrides (starts with uppercase)
+                    capwords_pattern = re.compile(r'\b([A-Z][a-zA-Z0-9_]*)\b')
+                    for match in capwords_pattern.finditer(text):
+                        word = match.group(1)
+                        start = match.start(1)
+                        end = match.end(1)
+                        
+                        # A Class call like MyClass() is NOT a variable, so don't override
+                        if text[end:].lstrip().startswith('('):
+                            continue
+                            
+                        is_var_context = False
+                        
+                        # Condition 1: Preceded or followed by = (Python assignment syntax)
+                        preceding_text = text[:start]
+                        has_eq_before = '=' in preceding_text
+                        has_eq_after = text[end:].lstrip().startswith('=')
+                        
+                        if has_eq_before or has_eq_after:
+                            is_var_context = True
+                            
+                        # Condition 2: Preceded by a C/C++ data type or another type identifier
+                        if not is_var_context:
+                            match_prev = re.search(r'\b([a-zA-Z_]\w*)\s+$', preceding_text)
+                            if match_prev:
+                                prev_word = match_prev.group(1)
+                                type_keywords = {
+                                    'int', 'float', 'double', 'char', 'bool', 'void', 
+                                    'short', 'long', 'unsigned', 'signed', 'const', 'static'
+                                }
+                                definition_blacklist = {
+                                    'class', 'struct', 'def', 'import', 'from', 'return', 
+                                    'new', 'delete', 'and', 'or', 'not', 'in', 'is', 'as', 
+                                    'lambda', 'yield', 'pass', 'except', 'raise'
+                                }
+                                # If preceded by a C type, or another identifier that is not in the blacklist
+                                if (prev_word in type_keywords or 
+                                    (prev_word[0].isupper() and prev_word not in definition_blacklist) or
+                                    (prev_word not in definition_blacklist)):
+                                    is_var_context = True
+                                    
+                        if is_var_context:
+                            self.setFormat(start, end - start, self.variable_format)
+
+                # 2. Apply unused symbols from AST
+                current_line_num = self.currentBlock().blockNumber() + 1
+                for item_line, start_col, length, fmt in self.unused_symbols_cache:
+                    if item_line == current_line_num:
+                        if start_col >= 0 and (start_col + length) <= len(text):
+                            self.setFormat(start_col, length, fmt)
         class CustomEditor(QPlainTextEdit):
             def __init__(self, parent=None):
                 super().__init__(parent)
@@ -1959,7 +2202,7 @@ class Main(QMainWindow):
         lang = self.ext_to_lang.get(ext)
         if not lang:
             return None, None
-        run_info = TYPE_FILE_RUN.get(lang)
+        run_info = TYPE_FILE.get(lang)
         return lang, run_info
 
     def _start_process(self, program, args, on_output, on_finished):
@@ -1987,7 +2230,6 @@ class Main(QMainWindow):
             runner_name: display name of runner
         """
         try:
-            from extension_manager import get_extension_hooks
             hooks = get_extension_hooks()
         except ImportError:
             hooks = None
@@ -2582,7 +2824,6 @@ class Main(QMainWindow):
         Returns:
             List of dicts with: displayName, description, version, has_theme, has_snippets
         """
-        from extension_manager import auto_load_extensions
         installed = auto_load_extensions()
         
         result = []
@@ -2610,7 +2851,6 @@ class Main(QMainWindow):
             Dict mapping command IDs to command info dicts.
         """
         ext_commands = {}
-        from extension_manager import list_installed
         
         for ext in list_installed():
             contributions = ext.get("contributions", {})
@@ -2632,7 +2872,6 @@ class Main(QMainWindow):
         Returns dict with language -> runner command mapping.
         """
         runners = {}
-        from extension_manager import list_installed
         
         for ext in list_installed():
             contributions = ext.get("contributions", {})
@@ -2735,7 +2974,7 @@ class Main(QMainWindow):
     def _load_extensions(self):
         """Load installed extensions and apply runtime hooks."""
         try:
-            from extension_manager import auto_load_extensions, apply_extension_hooks, get_extension_hooks
+            
             
             # Load all installed extensions
             extensions = auto_load_extensions()
@@ -2805,5 +3044,5 @@ def run():
 if __name__ == '__main__':
     run()
 
-#2025 VNCORE LAB (VNCode authored by Nguyen Truong Lam)
-#command build: pyinstaller --onedir --noconfirm --icon="icon_VNCode.ico" --add-data "fill_module.py;." --add-data "list_module.py;." --add-data "icon_VNCode.ico;." --add-data "close_hover.svg;." --add-data "close.svg;." --add-data "auto_load_fragment.py;." --add-data "extension_manager.py;." --add-data "extension_integration.py;." --add-data "extension_types.py;." --add-data "lsp_python.py;." --add-data "marketplace_widget.py;." --add-data "openvsx_api.py;." --add-data "icon/icon_L;icon/icon_L" run.py
+#2025 VNCORE LAB (VNCode authored by Nguyễn Trường Lâm)
+#command build: pyinstaller --onedir --noconfirm --icon="icon_VNCode.ico" --add-data "fill_module.py;." --add-data "list_module.py;." --add-data "icon_VNCode.ico;." --add-data "close_hover.svg;." --add-data "close.svg;." --add-data "marketplace_widget.py;." --add-data "api.py;." --add-data "core.py;." --add-data "icon/icon_L;icon/icon_L" run.py
